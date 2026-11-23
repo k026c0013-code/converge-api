@@ -4,6 +4,7 @@ import { AuthForm } from './AuthForm';
 import { DocumentList } from './DocumentList';
 import { DocumentRoom } from './DocumentRoom';
 import { HealthPanel } from './HealthPanel';
+import { clearSavedLocalCopies } from './offline';
 
 export function App() {
   const api = useMemo(() => new Api(), []);
@@ -15,6 +16,8 @@ export function App() {
   };
 
   async function logout() {
+    // Local copies with unsaved changes stay for the next sign-in (ADR-0011 §5).
+    if (user) await clearSavedLocalCopies(user.id).catch(() => 0);
     await api.logout();
     setUser(null);
     setDoc(null);

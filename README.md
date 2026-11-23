@@ -2,7 +2,7 @@
 
 リアルタイム共同編集 API と Web アプリ。要件は `docs/requirements-v1.0.md`、レビューは `docs/requirements-review.md`、設計判断は `docs/adr/`。
 
-現在: **Phase 3（Yjs による共同編集）完了**。設計は ADR-0008（Phase 1）、ADR-0009（Phase 2）、ADR-0010（Phase 3）。
+現在: **Phase 4（オフライン編集）完了**。設計は ADR-0008（Phase 1）、ADR-0009（Phase 2）、ADR-0010（Phase 3）、ADR-0011（Phase 4）。
 
 ## 前提
 - Node.js 24 / pnpm 12（`corepack enable pnpm`）
@@ -61,3 +61,10 @@ pnpm typecheck
 クライアントライブラリは `packages/client`（`@converge/client`: `ConvergeConnection` = チケット・在席・自動再接続、`YjsSync` = Y.Doc/Awareness の同期と再接続時の差分回復）。
 Web アプリ（`pnpm dev` → http://127.0.0.1:5173）でログイン → 文書を開くと Tiptap エディタで共同編集できる（見出し・太字・斜体・箇条書き・番号付き・他人のカーソル）。
 ブラウザの Origin 許可リストは `WS_ALLOWED_ORIGINS`（既定は Vite の開発サーバー）。
+
+## オフライン編集（Phase 4, ADR-0011）
+- 文書は IndexedDB（`converge:{userId}:{documentId}`）にも保存され、接続が切れても編集を続けられる。
+- 再接続すると state vector を交換して、足りない差分の取得と未送信分の送信を行い、ACK がそろうと「同期済み」になる。
+- ログアウト時は保存済みの文書だけローカルから消える。未送信の変更がある文書は次回のログインまで残る。
+- アクセストークンはメモリだけに持つので、ページの再読み込みにはオンラインでのログインが必要。
+

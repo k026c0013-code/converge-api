@@ -4,6 +4,7 @@ import { Awareness } from 'y-protocols/awareness';
 import * as Y from 'yjs';
 import { ApiError, type Api, type DocumentInfo, type User } from './api';
 import { Editor } from './Editor';
+import { dirtyStore, discardLocal, openLocal } from './offline';
 
 const statusLabel: Record<Status, string> = {
   idle: '待機中',
@@ -27,7 +28,7 @@ const stopLabel: Record<StopReason, string> = {
 /** Document room: collaborative editor, presence and sync status (Phase 3, ADR-0010). */
 export function DocumentRoom({ api, user, doc, onBack }: { api: Api; user: User; doc: DocumentInfo; onBack: () => void }) {
   const [status, setStatus] = useState<Status>('idle');
-  const [sync, setSync] = useState<{ state: SyncState; pending: number }>({ state: 'offline', pending: 0 });
+  const [sync, setSync] = useState<{ state: SyncState; pending: number; dirty: boolean }>({ state: 'offline', pending: 0, dirty: false });
   const [role, setRole] = useState<Role | null>(null);
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [stopped, setStopped] = useState<StopReason | null>(null);
@@ -41,24 +42,51 @@ export function DocumentRoom({ api, user, doc, onBack }: { api: Api; user: User;
   useEffect(() => {
     const ydoc = new Y.Doc();
     const awareness = new Awareness(ydoc);
-    setShared({ ydoc, awareness });
-    const conn = new ConvergeConnection({ documentId: doc.id, getAccessToken: () => api.accessToken() });
-    const yjs = new YjsSync(conn, ydoc, awareness);
-    conn.on('status', setStatus);
-    conn.on('ready', (r) => setRole(r.role));
-    conn.on('roleChanged', setRole);
-    conn.on('participants', setParticipants);
-    conn.on('serverError', (e) => setNotice(e.code === 'FORBIDDEN' ? '閲覧者は編集できません' : e.message));
-    conn.on('stopped', setStopped);
-    yjs.onChange((state, pending) => setSync({ state, pending }));
-    conn.connect();
+    let disposed = false;
+    let cleanup = () => {};
+
+    // Load the local IndexedDB copy first, so offline edits go out with the first sync (ADR-0011 §1).
+    void openLocal(user.id, doc.id, ydoc).then(
+      (persistence) => {
+        if (disposed) {
+          void persistence.destroy();
+          return;
+        }
+        setShared({ ydoc, awareness });
+        const conn = new ConvergeConnection({ documentId: doc.id, getAccessToken: () => api.accessToken() });
+        const yjs = new YjsSync(conn, ydoc, awareness, { dirtyStore: dirtyStore(user.id, doc.id) });
+        conn.on('status', setStatus);
+        conn.on('ready', (r) => setRole(r.role));
+        conn.on('roleChanged', setRole);
+        conn.on('participants', setParticipants);
+        conn.on('serverError', (e) => setNotice(e.code === 'FORBIDDEN' ? '閲覧者は編集できません' : e.message));
+        conn.on('stopped', (reason) => {
+          setStopped(reason);
+          if (reason === 'document_deleted' || reason === 'access_revoked') {
+            // Nowhere left to send local changes: drop the copy and say so if anything was unsaved.
+            if (yjs.dirty) setNotice('保存されていない変更がありましたが、送信先がなくなったため破棄しました');
+            void persistence.destroy().then(() => discardLocal(user.id, doc.id));
+          }
+        });
+        yjs.onChange((state, pending, dirty) => setSync({ state, pending, dirty }));
+        setSync({ state: yjs.state, pending: 0, dirty: yjs.dirty });
+        conn.connect();
+        cleanup = () => {
+          yjs.destroy();
+          conn.close();
+          void persistence.destroy();
+        };
+      },
+      () => setNotice('この端末に文書を保存できません（IndexedDB が使えません）'),
+    );
+
     return () => {
-      yjs.destroy();
-      conn.close();
+      disposed = true;
+      cleanup();
       awareness.destroy();
       ydoc.destroy();
     };
-  }, [api, doc.id]);
+  }, [api, user.id, doc.id]);
 
   async function addMember(e: FormEvent) {
     e.preventDefault();
@@ -71,7 +99,9 @@ export function DocumentRoom({ api, user, doc, onBack }: { api: Api; user: User;
     }
   }
 
-  const editable = role !== null && role !== 'viewer' && status === 'open';
+  // Keep editing through connection drops; viewers never edit (ADR-0011 §4).
+  const effectiveRole = role ?? doc.myRole;
+  const editable = effectiveRole !== 'viewer' && stopped === null;
 
   return (
     <section>
@@ -82,6 +112,7 @@ export function DocumentRoom({ api, user, doc, onBack }: { api: Api; user: User;
         <strong data-testid="sync-status">
           {syncLabel[sync.state]}
           {sync.pending > 0 && `（保存待ち ${sync.pending}）`}
+          {sync.state === 'offline' && sync.dirty && '（未送信の変更あり）'}
         </strong>
         {role && <> ／ あなたの権限: {role}</>}
       </p>

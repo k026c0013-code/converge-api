@@ -7,6 +7,11 @@ export const REMOTE = Symbol('converge-remote');
 
 export type SyncState = 'offline' | 'syncing' | 'synced';
 
+export interface YjsSyncOptions {
+  /** Persists the "has unsaved local changes" flag across reloads (e.g. localStorage). */
+  dirtyStore?: { get(): boolean; set(dirty: boolean): void };
+}
+
 /** True when an encoded update carries no structs and no deletions. */
 function isEmptyUpdate(update: Uint8Array): boolean {
   const { structs, ds } = Y.decodeUpdate(update);
@@ -24,23 +29,32 @@ export class YjsSync {
   private readonly unsubs: Array<() => void> = [];
   private readonly pending = new Set<string>();
   private _state: SyncState = 'offline';
-  private readonly listeners = new Set<(s: SyncState, pending: number) => void>();
+  private open = false;
+  /** sync:complete received on the current connection. */
+  private complete = false;
+  private _dirty: boolean;
+  private readonly listeners = new Set<(s: SyncState, pending: number, dirty: boolean) => void>();
 
   constructor(
     private readonly conn: ConvergeConnection,
     readonly doc: Y.Doc,
     readonly awareness?: awarenessProtocol.Awareness,
+    private readonly opts: YjsSyncOptions = {},
   ) {
+    this._dirty = opts.dirtyStore?.get() ?? false;
     const onDocUpdate = (update: Uint8Array, origin: unknown) => {
-      if (origin === REMOTE || this._state !== 'synced' || !this.canEdit()) return;
-      this.submit(update);
+      if (origin === REMOTE || !this.canEdit()) return;
+      if (this.open && this.complete) this.submit(update);
+      else this.setDirty(true); // offline: recovered by the next state-vector sync (ADR-0011 §2)
     };
     doc.on('update', onDocUpdate);
     this.unsubs.push(() => doc.off('update', onDocUpdate));
 
     this.unsubs.push(
       conn.on('ready', () => {
-        this.setState('syncing');
+        this.open = true;
+        this.complete = false;
+        this.recompute();
         conn.requestSync(Y.encodeStateVector(doc));
         this.sendLocalAwareness();
       }),
@@ -51,10 +65,13 @@ export class YjsSync {
           if (!isEmptyUpdate(missing)) this.submit(missing);
         }
       }),
-      conn.on('syncComplete', () => this.setState('synced')),
+      conn.on('syncComplete', () => {
+        this.complete = true;
+        this.recompute();
+      }),
       conn.on('update', (u) => Y.applyUpdate(doc, u.payload, REMOTE)),
       conn.on('ack', (id) => {
-        if (this.pending.delete(id)) this.emit();
+        if (this.pending.delete(id)) this.recompute();
       }),
       conn.on('serverError', (e) => {
         // A failed save is recovered by a fresh state-vector sync (the server tells us what it lacks).
@@ -64,8 +81,10 @@ export class YjsSync {
       }),
       conn.on('status', (s) => {
         if (s !== 'open') {
+          this.open = false;
+          this.complete = false;
           this.pending.clear();
-          this.setState('offline');
+          this.recompute();
           this.dropRemoteAwareness();
         }
       }),
@@ -92,12 +111,17 @@ export class YjsSync {
     return this._state;
   }
 
+  /** Local changes the server has not confirmed yet (ADR-0011 §2). */
+  get dirty(): boolean {
+    return this._dirty;
+  }
+
   /** Updates sent but not yet confirmed as persisted. */
   get pendingCount(): number {
     return this.pending.size;
   }
 
-  onChange(fn: (state: SyncState, pending: number) => void): () => void {
+  onChange(fn: (state: SyncState, pending: number, dirty: boolean) => void): () => void {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
   }
@@ -112,11 +136,10 @@ export class YjsSync {
   }
 
   private submit(update: Uint8Array): void {
+    this.setDirty(true);
     const id = this.conn.sendUpdate(update);
-    if (id) {
-      this.pending.add(id);
-      this.emit();
-    }
+    if (id) this.pending.add(id);
+    this.recompute();
   }
 
   private sendLocalAwareness(): void {
@@ -130,13 +153,21 @@ export class YjsSync {
     if (others.length) awarenessProtocol.removeAwarenessStates(this.awareness, others, REMOTE);
   }
 
-  private setState(s: SyncState): void {
-    if (this._state === s) return;
-    this._state = s;
+  /** offline → not connected; syncing → before sync:complete or with unacknowledged updates; synced → all saved. */
+  private recompute(): void {
+    const next: SyncState = !this.open ? 'offline' : !this.complete || this.pending.size > 0 ? 'syncing' : 'synced';
+    this._state = next;
+    if (next === 'synced') this.setDirty(false);
     this.emit();
   }
 
+  private setDirty(d: boolean): void {
+    if (this._dirty === d) return;
+    this._dirty = d;
+    this.opts.dirtyStore?.set(d);
+  }
+
   private emit(): void {
-    for (const fn of this.listeners) fn(this._state, this.pending.size);
+    for (const fn of this.listeners) fn(this._state, this.pending.size, this._dirty);
   }
 }

@@ -336,4 +336,4 @@ export class ConvergeConnection {
     for (const fn of this.listeners[event]) (fn as (...a: Parameters<ConvergeEvents[K]>) => void)(...args);
   }
 }
-export { REMOTE, YjsSync, type SyncState } from './yjs.js';
+export { REMOTE, YjsSync, type SyncState, type YjsSyncOptions } from './yjs.js';
