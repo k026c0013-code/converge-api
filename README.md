@@ -2,7 +2,7 @@
 
 リアルタイム共同編集 API と Web アプリ。要件は `docs/requirements-v1.0.md`、レビューは `docs/requirements-review.md`、設計判断は `docs/adr/`。
 
-現在: **Phase 4（オフライン編集）完了**。設計は ADR-0008（Phase 1）、ADR-0009（Phase 2）、ADR-0010（Phase 3）、ADR-0011（Phase 4）。
+現在: **Phase 5（履歴・復元）完了**。設計は ADR-0008〜0012（Phase 1〜5）。
 
 ## 前提
 - Node.js 24 / pnpm 12（`corepack enable pnpm`）
@@ -67,4 +67,14 @@ Web アプリ（`pnpm dev` → http://127.0.0.1:5173）でログイン → 文�
 - 再接続すると state vector を交換して、足りない差分の取得と未送信分の送信を行い、ACK がそろうと「同期済み」になる。
 - ログアウト時は保存済みの文書だけローカルから消える。未送信の変更がある文書は次回のログインまで残る。
 - アクセストークンはメモリだけに持つので、ページの再読み込みにはオンラインでのログインが必要。
+
+## 履歴・バージョン・復元（Phase 5, ADR-0012）
+| メソッド | パス | 内容 | 権限 |
+|---|---|---|---|
+| GET | /api/v1/documents/{id}/history | 更新ログ（新しい順、`before` でページング） | メンバー |
+| GET / POST | /api/v1/documents/{id}/versions | 一覧 / いまの状態を名前付きで保存 | メンバー / Owner・Editor |
+| GET | /api/v1/documents/{id}/versions/{versionId} | 過去状態の参照（Yjs 状態と XML） | メンバー |
+| POST | /api/v1/documents/{id}/restore | 新しい編集として復元。直前の状態は「復元前」バージョンとして自動保存 | Owner |
+
+スナップショットは 500 更新ごととバージョン作成時に作られ、読み込みは「最新スナップショット＋それ以降の更新」で行う。更新ログは削除しない（保持期間は未決定）。
 

@@ -4,6 +4,7 @@ import { Awareness } from 'y-protocols/awareness';
 import * as Y from 'yjs';
 import { ApiError, type Api, type DocumentInfo, type User } from './api';
 import { Editor } from './Editor';
+import { VersionsPanel } from './VersionsPanel';
 import { dirtyStore, discardLocal, openLocal } from './offline';
 
 const statusLabel: Record<Status, string> = {
@@ -120,6 +121,8 @@ export function DocumentRoom({ api, user, doc, onBack }: { api: Api; user: User;
       {notice && <p>{notice}</p>}
 
       {shared && <Editor doc={shared.ydoc} awareness={shared.awareness} editable={editable} userName={user.displayName} />}
+
+      <VersionsPanel api={api} documentId={doc.id} role={effectiveRole} />
 
       <h3>参加中（{participants.length}）</h3>
       <ul data-testid="participants">

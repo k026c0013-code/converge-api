@@ -4,11 +4,13 @@ import type { TypeBoxTypeProvider } from '@fastify/type-provider-typebox';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { authRoutes } from './auth/routes.js';
 import type { HubLimits } from './collab/hub.js';
+import { LiveDocuments } from './collab/documents.js';
 import { attachCollab } from './collab/server.js';
 import { MemoryTicketStore, type TicketStore } from './collab/tickets.js';
 import { AccessEvents } from './events.js';
 import { DEFAULT_RATE_LIMITS, type AuthConfig, type RateLimitConfig } from './config.js';
 import { documentRoutes } from './documents/routes.js';
+import { historyRoutes } from './history/routes.js';
 import { AppError, registerErrorHandling } from './errors.js';
 import type { PrismaClient } from './generated/prisma/client.js';
 import { userRoutes } from './users/routes.js';
@@ -31,6 +33,8 @@ export interface AppOptions {
     tickets?: TicketStore;
     limits?: Partial<HubLimits>;
     maxPayloadBytes?: number;
+    /** Snapshot after this many updates (ADR-0012). */
+    snapshotEvery?: number;
   };
 }
 
@@ -107,8 +111,13 @@ export function buildApp(options: AppOptions): FastifyInstance {
   if (options.prisma && options.auth) {
     const events = new AccessEvents();
     const tickets = options.realtime?.tickets ?? new MemoryTicketStore();
-    const deps = { prisma: options.prisma, auth: options.auth, rateLimits: limits, events, tickets };
+    const live = new LiveDocuments(options.prisma, {
+      snapshotEvery: options.realtime?.snapshotEvery,
+      onError: (err, context) => app.log.error({ err }, context),
+    });
+    const deps = { prisma: options.prisma, auth: options.auth, rateLimits: limits, events, tickets, live };
     attachCollab(app, {
+      live,
       prisma: options.prisma,
       tickets,
       events,
@@ -119,6 +128,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
     void app.register(authRoutes, { ...deps, prefix: '/api/v1/auth' });
     void app.register(userRoutes, { ...deps, prefix: '/api/v1/users' });
     void app.register(documentRoutes, { ...deps, prefix: '/api/v1/documents' });
+    void app.register(historyRoutes, { ...deps, prefix: '/api/v1/documents' });
   }
 
   return app;

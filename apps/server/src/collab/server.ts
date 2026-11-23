@@ -4,7 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
 import type { AccessEvents } from '../events.js';
 import type { PrismaClient } from '../generated/prisma/client.js';
-import { LiveDocuments } from './documents.js';
+import type { LiveDocuments } from './documents.js';
 import { CollabHub, DEFAULT_HUB_LIMITS, type HubLimits } from './hub.js';
 import { isUuid, type SessionRole } from './protocol.js';
 import type { TicketStore } from './tickets.js';
@@ -18,8 +18,8 @@ export interface CollabOptions {
   /** Max size of one incoming frame (ADR-0009 §2). */
   maxPayloadBytes?: number;
   limits?: Partial<HubLimits>;
-  /** How long an unused document stays in memory after its last session leaves. */
-  unloadDelayMs?: number;
+  /** Shared with the REST routes (versions, restore). */
+  live: LiveDocuments;
 }
 
 export const MAX_WS_PAYLOAD_BYTES = 1024 * 1024;
@@ -50,7 +50,7 @@ function rejectUpgrade(socket: Duplex, status: number, code: string): void {
  * The handshake is validated before upgrading so failures are plain HTTP errors.
  */
 export function attachCollab(app: FastifyInstance, opts: CollabOptions): { hub: CollabHub; live: LiveDocuments } {
-  const live = new LiveDocuments(opts.prisma, opts.unloadDelayMs);
+  const { live } = opts;
   const hub = new CollabHub(opts.events, live, { ...DEFAULT_HUB_LIMITS, ...opts.limits }, (err, context) =>
     app.log.error({ err }, context),
   );

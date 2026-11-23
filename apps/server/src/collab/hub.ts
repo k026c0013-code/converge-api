@@ -100,11 +100,22 @@ export class CollabHub {
         }
       }
     };
+    // Server-made edits (restore) go to everyone connected, like any other update.
+    const offServerUpdate = live.onServerUpdate((u) => {
+      const out: ServerMessage = {
+        type: 'update:broadcast',
+        updateId: u.updateId,
+        payload: b64(u.update),
+        from: { sessionId: 'server', userId: u.userId },
+      };
+      for (const s of this.sessionsOf(u.documentId)) this.send(s, out);
+    });
     events.on('memberRoleChanged', onRole);
     events.on('memberRemoved', onRemoved);
     events.on('documentDeleted', onDeleted);
     events.on('tokenFamilyRevoked', onFamily);
     this.unsubscribe = () => {
+      offServerUpdate();
       events.off('memberRoleChanged', onRole);
       events.off('memberRemoved', onRemoved);
       events.off('documentDeleted', onDeleted);

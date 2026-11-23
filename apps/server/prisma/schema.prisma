@@ -54,7 +54,9 @@ model Document {
 
   owner   User             @relation(fields: [ownerId], references: [id], onDelete: Restrict)
   members DocumentMember[]
-  updates DocumentUpdate[]
+  updates   DocumentUpdate[]
+  snapshots DocumentSnapshot[]
+  versions  DocumentVersion[]
 
   @@index([ownerId, deletedAt])
   @@map("documents")
@@ -91,6 +93,39 @@ model DocumentUpdate {
   @@unique([documentId, updateId])
   @@index([documentId, id])
   @@map("document_updates")
+}
+
+/// Full document state up to and including document_updates.id = last_update_id (ADR-0012 §1).
+model DocumentSnapshot {
+  id           String   @id @db.Char(36)
+  documentId   String   @map("document_id") @db.Char(36)
+  stateData    Bytes    @map("state_data") @db.LongBlob
+  lastUpdateId BigInt   @map("last_update_id")
+  createdAt    DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  document Document          @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  versions DocumentVersion[]
+
+  @@index([documentId, lastUpdateId])
+  @@map("document_snapshots")
+}
+
+/// A named point in history (ADR-0012 §2). kind: "manual" | "pre_restore".
+model DocumentVersion {
+  id         String   @id @db.Char(36)
+  documentId String   @map("document_id") @db.Char(36)
+  snapshotId String   @map("snapshot_id") @db.Char(36)
+  createdBy  String   @map("created_by") @db.Char(36)
+  name       String   @db.VarChar(100)
+  note       String?  @db.VarChar(500)
+  kind       String   @default("manual") @db.VarChar(16)
+  createdAt  DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  document Document         @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  snapshot DocumentSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Restrict)
+
+  @@index([documentId, createdAt])
+  @@map("document_versions")
 }
 
 /// Security/audit trail, separate from the CRDT update log (requirements §4.6).

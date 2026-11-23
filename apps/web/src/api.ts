@@ -16,6 +16,23 @@ export interface DocumentInfo {
   updatedAt: string;
 }
 
+export interface VersionInfo {
+  id: string;
+  name: string;
+  note: string | null;
+  kind: 'manual' | 'pre_restore' | string;
+  createdBy: string;
+  createdAt: string;
+}
+
+export interface HistoryEntry {
+  id: string;
+  userId: string;
+  displayName: string | null;
+  size: number;
+  createdAt: string;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -87,6 +104,26 @@ export class Api {
 
   addMember(documentId: string, email: string, role: 'editor' | 'viewer'): Promise<unknown> {
     return this.call('POST', `/documents/${documentId}/members`, { email, role });
+  }
+
+  listVersions(documentId: string): Promise<{ items: VersionInfo[] }> {
+    return this.call('GET', `/documents/${documentId}/versions`);
+  }
+
+  createVersion(documentId: string, name: string, note?: string): Promise<VersionInfo> {
+    return this.call('POST', `/documents/${documentId}/versions`, note ? { name, note } : { name });
+  }
+
+  getVersion(documentId: string, versionId: string): Promise<{ version: VersionInfo; state: string; content: string }> {
+    return this.call('GET', `/documents/${documentId}/versions/${versionId}`);
+  }
+
+  restore(documentId: string, versionId: string): Promise<{ restoredVersionId: string; preRestoreVersionId: string }> {
+    return this.call('POST', `/documents/${documentId}/restore`, { versionId });
+  }
+
+  history(documentId: string): Promise<{ items: HistoryEntry[] }> {
+    return this.call('GET', `/documents/${documentId}/history?limit=20`);
   }
 
   private async refresh(): Promise<void> {

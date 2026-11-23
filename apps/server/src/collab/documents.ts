@@ -1,5 +1,6 @@
-import type * as Y from 'yjs';
-import { engineFor, type CRDTEngine } from '../crdt/engine.js';
+import { randomUUID } from 'node:crypto';
+import * as Y from 'yjs';
+import { CONTENT_ROOT, engineFor, type CRDTEngine } from '../crdt/engine.js';
 import { Prisma, type PrismaClient } from '../generated/prisma/client.js';
 
 export interface SubmitInput {
@@ -9,6 +10,23 @@ export interface SubmitInput {
   update: Uint8Array;
 }
 
+/** An update created by the server itself (e.g. a restore) that connected clients must receive. */
+export interface ServerUpdate {
+  documentId: string;
+  updateId: string;
+  userId: string;
+  update: Uint8Array;
+}
+
+export interface VersionInfo {
+  id: string;
+  name: string;
+  note: string | null;
+  kind: string;
+  createdBy: string;
+  createdAt: Date;
+}
+
 interface Live {
   doc: Y.Doc;
   engine: CRDTEngine<Y.Doc>;
@@ -16,20 +34,43 @@ interface Live {
   /** Serializes persist+apply per document so DB order and apply order agree (ADR-0010 §3). */
   queue: Promise<unknown>;
   unloadTimer: NodeJS.Timeout | null;
+  /** Highest document_updates.id reflected in `doc` (0n when none). */
+  lastUpdateId: bigint;
+  updatesSinceSnapshot: number;
+}
+
+export interface LiveDocumentsOptions {
+  unloadDelayMs?: number;
+  /** Take a snapshot after this many updates (ADR-0012 §1). */
+  snapshotEvery?: number;
+  onError?: (err: unknown, context: string) => void;
 }
 
 /**
- * In-memory documents rebuilt from document_updates (ADR-0010 §3).
+ * In-memory documents rebuilt from snapshots + document_updates (ADR-0010 §3, ADR-0012 §1).
  * The database is the source of truth; memory is a cache that can be dropped at any time.
  */
 export class LiveDocuments {
   private readonly live = new Map<string, Live>();
   private readonly loading = new Map<string, Promise<Live>>();
+  private readonly serverUpdateListeners = new Set<(u: ServerUpdate) => void>();
+  private readonly unloadDelayMs: number;
+  private readonly snapshotEvery: number;
+  private readonly onError: (err: unknown, context: string) => void;
 
   constructor(
     private readonly prisma: PrismaClient,
-    private readonly unloadDelayMs = 30_000,
-  ) {}
+    opts: LiveDocumentsOptions = {},
+  ) {
+    this.unloadDelayMs = opts.unloadDelayMs ?? 30_000;
+    this.snapshotEvery = opts.snapshotEvery ?? 500;
+    this.onError = opts.onError ?? (() => {});
+  }
+
+  onServerUpdate(fn: (u: ServerUpdate) => void): () => void {
+    this.serverUpdateListeners.add(fn);
+    return () => this.serverUpdateListeners.delete(fn);
+  }
 
   async acquire(documentId: string, engineName: string): Promise<void> {
     const entry = await this.load(documentId, engineName);
@@ -56,7 +97,7 @@ export class LiveDocuments {
     return this.live.has(documentId);
   }
 
-  /** Drops a document from memory immediately (e.g. after deletion or an apply failure). */
+  /** Drops a document from memory immediately (e.g. after an apply failure). */
   evict(documentId: string): void {
     const entry = this.live.get(documentId);
     if (entry?.unloadTimer) clearTimeout(entry.unloadTimer);
@@ -87,33 +128,150 @@ export class LiveDocuments {
    */
   submit(documentId: string, input: SubmitInput): Promise<'applied' | 'duplicate'> {
     const entry = this.require(documentId);
-    const run = async (): Promise<'applied' | 'duplicate'> => {
-      try {
-        await this.prisma.documentUpdate.create({
-          data: {
-            documentId,
-            updateId: input.updateId,
-            clientId: input.sessionId,
-            userId: input.userId,
-            updateData: Buffer.from(input.update),
-          },
-        });
-      } catch (err) {
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') return 'duplicate';
-        throw err;
-      }
-      try {
-        entry.engine.applyUpdate(entry.doc, input.update, 'persisted');
-      } catch (err) {
-        // Validated updates should always apply. If not, the DB is still right: rebuild on next access.
-        this.evict(documentId);
-        throw err;
-      }
+    return this.enqueue(entry, async () => {
+      const row = await this.persist(documentId, input.updateId, input.sessionId, input.userId, input.update);
+      if (!row) return 'duplicate';
+      this.applyPersisted(documentId, entry, row, input.update);
+      await this.maybeSnapshot(documentId, entry);
       return 'applied';
-    };
-    const result = entry.queue.then(run, run);
+    });
+  }
+
+  /** Saves the current state as a named version (ADR-0012 §2). Loads the document if needed. */
+  async createVersion(
+    documentId: string,
+    engineName: string,
+    input: { createdBy: string; name: string; note?: string | null; kind?: 'manual' | 'pre_restore' },
+  ): Promise<VersionInfo> {
+    return this.withDocument(documentId, engineName, (entry) =>
+      this.enqueue(entry, () => this.versionLocked(documentId, entry, input)),
+    );
+  }
+
+  /**
+   * Restores a version as a new edit (ADR-0012 §3): saves a pre-restore version, replaces the
+   * `content` children with the version's, persists, applies and notifies connected clients.
+   */
+  async restore(
+    documentId: string,
+    engineName: string,
+    input: { versionId: string; userId: string; preRestoreName: string },
+  ): Promise<{ preRestoreVersionId: string }> {
+    return this.withDocument(documentId, engineName, (entry) =>
+      this.enqueue(entry, async () => {
+        const version = await this.prisma.documentVersion.findFirst({
+          where: { id: input.versionId, documentId },
+          include: { snapshot: { select: { stateData: true } } },
+        });
+        if (!version) throw new VersionNotFoundError();
+
+        const pre = await this.versionLocked(documentId, entry, {
+          createdBy: input.userId,
+          name: input.preRestoreName,
+          kind: 'pre_restore',
+        });
+
+        const target = new Y.Doc();
+        Y.applyUpdate(target, version.snapshot.stateData);
+        const update = buildReplacementUpdate(entry.doc, target);
+        if (update) {
+          const updateId = randomUUID();
+          const row = await this.persist(documentId, updateId, 'server:restore', input.userId, update);
+          if (!row) throw new Error('restore update id collided');
+          this.applyPersisted(documentId, entry, row, update);
+          for (const fn of this.serverUpdateListeners) fn({ documentId, updateId, userId: input.userId, update });
+          await this.maybeSnapshot(documentId, entry);
+        }
+        return { preRestoreVersionId: pre.id };
+      }),
+    );
+  }
+
+  /** The `content` of a version as XML text (requirements §4.6 "過去状態の参照"). */
+  static contentOf(state: Uint8Array): string {
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, state);
+    return doc.getXmlFragment(CONTENT_ROOT).toString();
+  }
+
+  // ---- internals -------------------------------------------------------
+
+  private enqueue<T>(entry: Live, fn: () => Promise<T>): Promise<T> {
+    const result = entry.queue.then(fn, fn);
     entry.queue = result.catch(() => undefined);
     return result;
+  }
+
+  private async withDocument<T>(documentId: string, engineName: string, fn: (entry: Live) => Promise<T>): Promise<T> {
+    await this.acquire(documentId, engineName);
+    try {
+      return await fn(this.require(documentId));
+    } finally {
+      this.release(documentId);
+    }
+  }
+
+  /** Inserts the update; returns its row id, or null when (documentId, updateId) already exists. */
+  private async persist(documentId: string, updateId: string, clientId: string, userId: string, update: Uint8Array) {
+    try {
+      return await this.prisma.documentUpdate.create({
+        data: { documentId, updateId, clientId, userId, updateData: Buffer.from(update) },
+        select: { id: true },
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') return null;
+      throw err;
+    }
+  }
+
+  private applyPersisted(documentId: string, entry: Live, row: { id: bigint }, update: Uint8Array): void {
+    try {
+      entry.engine.applyUpdate(entry.doc, update, 'persisted');
+    } catch (err) {
+      // Validated updates should always apply. If not, the DB is still right: rebuild on next access.
+      this.evict(documentId);
+      throw err;
+    }
+    entry.lastUpdateId = row.id;
+    entry.updatesSinceSnapshot++;
+  }
+
+  private async maybeSnapshot(documentId: string, entry: Live): Promise<void> {
+    if (entry.updatesSinceSnapshot < this.snapshotEvery) return;
+    try {
+      await this.snapshotLocked(documentId, entry);
+    } catch (err) {
+      this.onError(err, 'snapshot failed'); // not fatal: the update itself is saved
+    }
+  }
+
+  private async snapshotLocked(documentId: string, entry: Live): Promise<string> {
+    const id = randomUUID();
+    await this.prisma.documentSnapshot.create({
+      data: { id, documentId, stateData: Buffer.from(entry.engine.encodeState(entry.doc)), lastUpdateId: entry.lastUpdateId },
+    });
+    entry.updatesSinceSnapshot = 0;
+    return id;
+  }
+
+  private async versionLocked(
+    documentId: string,
+    entry: Live,
+    input: { createdBy: string; name: string; note?: string | null; kind?: 'manual' | 'pre_restore' },
+  ): Promise<VersionInfo> {
+    const snapshotId = await this.snapshotLocked(documentId, entry);
+    return this.prisma.documentVersion.create({
+      data: {
+        id: randomUUID(),
+        documentId,
+        snapshotId,
+        createdBy: input.createdBy,
+        name: input.name,
+        note: input.note ?? null,
+        kind: input.kind ?? 'manual',
+      },
+      select: { id: true, name: true, note: true, kind: true, createdBy: true, createdAt: true },
+    });
   }
 
   private require(documentId: string): Live {
@@ -131,20 +289,33 @@ export class LiveDocuments {
     const promise = (async () => {
       const engine = engineFor(engineName);
       const doc = engine.createDocument();
+      let lastUpdateId = 0n;
+      const snapshot = await this.prisma.documentSnapshot.findFirst({
+        where: { documentId },
+        orderBy: { lastUpdateId: 'desc' },
+        select: { stateData: true, lastUpdateId: true },
+      });
+      if (snapshot) {
+        engine.applyUpdate(doc, snapshot.stateData, 'persisted');
+        lastUpdateId = snapshot.lastUpdateId;
+      }
       const PAGE = 500;
-      let cursor: bigint | undefined;
+      let since = 0;
       for (;;) {
         const rows = await this.prisma.documentUpdate.findMany({
-          where: { documentId, ...(cursor !== undefined && { id: { gt: cursor } }) },
+          where: { documentId, id: { gt: lastUpdateId } },
           orderBy: { id: 'asc' },
           select: { id: true, updateData: true },
           take: PAGE,
         });
-        for (const r of rows) engine.applyUpdate(doc, r.updateData, 'persisted');
+        for (const r of rows) {
+          engine.applyUpdate(doc, r.updateData, 'persisted');
+          lastUpdateId = r.id;
+        }
+        since += rows.length;
         if (rows.length < PAGE) break;
-        cursor = rows.at(-1)!.id;
       }
-      const entry: Live = { doc, engine, refs: 0, queue: Promise.resolve(), unloadTimer: null };
+      const entry: Live = { doc, engine, refs: 0, queue: Promise.resolve(), unloadTimer: null, lastUpdateId, updatesSinceSnapshot: since };
       this.live.set(documentId, entry);
       return entry;
     })().finally(() => this.loading.delete(documentId));
@@ -152,4 +323,29 @@ export class LiveDocuments {
     this.loading.set(documentId, promise);
     return promise;
   }
+}
+
+export class VersionNotFoundError extends Error {
+  constructor() {
+    super('version not found');
+  }
+}
+
+/**
+ * One Yjs update that turns `current`'s content into `target`'s content:
+ * delete every current child, insert clones of the target's children. Returns null if nothing changes.
+ */
+export function buildReplacementUpdate(current: Y.Doc, target: Y.Doc): Uint8Array | null {
+  const work = new Y.Doc();
+  Y.applyUpdate(work, Y.encodeStateAsUpdate(current));
+  const before = Y.encodeStateVector(work);
+  const fragment = work.getXmlFragment(CONTENT_ROOT);
+  const source = target.getXmlFragment(CONTENT_ROOT);
+  if (fragment.toString() === source.toString()) return null;
+  work.transact(() => {
+    if (fragment.length > 0) fragment.delete(0, fragment.length);
+    const clones = source.toArray().map((child) => (child as Y.XmlElement | Y.XmlText).clone());
+    if (clones.length > 0) fragment.insert(0, clones);
+  });
+  return Y.encodeStateAsUpdate(work, before);
 }

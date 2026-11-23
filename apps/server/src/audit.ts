@@ -11,7 +11,9 @@ export type AuditAction =
   | 'document.delete'
   | 'member.add'
   | 'member.update'
-  | 'member.remove';
+  | 'member.remove'
+  | 'version.create'
+  | 'document.restore';
 
 export interface AuditEntry {
   action: AuditAction;
