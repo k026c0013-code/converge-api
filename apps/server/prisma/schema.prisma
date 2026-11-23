@@ -1,0 +1,10 @@
+// Converge API schema. Models arrive in Phase 1 (see docs/requirements-v1.0.md §8, ADR-0002).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
