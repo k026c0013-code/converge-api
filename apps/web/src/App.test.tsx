@@ -30,3 +30,28 @@ describe('App health panel', () => {
     expect(screen.getByTestId('db-status').textContent).toBe('停止');
   });
 });
+
+describe('App sign-in flow', () => {
+  it('logs in and shows the document list', async () => {
+    const { fireEvent } = await import('@testing-library/react');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/auth/login')) {
+        return new Response(JSON.stringify({
+          user: { id: 'u1', email: 'a@example.test', displayName: 'Alice' },
+          tokens: { tokenType: 'Bearer', accessToken: 'h.e30.s', refreshToken: 'r', expiresIn: 900 },
+        }), { status: 200 });
+      }
+      if (url.includes('/documents')) {
+        return new Response(JSON.stringify({ items: [{ id: 'd1', title: '議事録', myRole: 'owner', updatedAt: '' }], nextCursor: null }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    }));
+    render(<App />);
+    fireEvent.change(screen.getByLabelText('メールアドレス'), { target: { value: 'a@example.test' } });
+    fireEvent.change(screen.getByLabelText('パスワード'), { target: { value: 'password123' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'ログイン' })[0]!);
+    await waitFor(() => expect(screen.getByText('議事録')).toBeTruthy());
+    expect(screen.getByText(/Alice/)).toBeTruthy();
+  });
+});

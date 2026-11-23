@@ -1,35 +1,39 @@
-import { useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
+import { Api, type DocumentInfo, type User } from './api';
+import { AuthForm } from './AuthForm';
+import { DocumentList } from './DocumentList';
+import { DocumentRoom } from './DocumentRoom';
+import { HealthPanel } from './HealthPanel';
 
-type Status = 'checking' | 'up' | 'down';
-
-async function probe(path: string): Promise<Status> {
-  try {
-    const res = await fetch(path);
-    return res.ok ? 'up' : 'down';
-  } catch {
-    return 'down';
-  }
-}
-
-const label: Record<Status, string> = { checking: '確認中…', up: '正常', down: '停止' };
-
-/** Phase 0 placeholder: shows that web → API → database are wired together. */
 export function App() {
-  const [api, setApi] = useState<Status>('checking');
-  const [db, setDb] = useState<Status>('checking');
+  const api = useMemo(() => new Api(), []);
+  const [user, setUser] = useState<User | null>(null);
+  const [doc, setDoc] = useState<DocumentInfo | null>(null);
+  api.onSignedOut = () => {
+    setUser(null);
+    setDoc(null);
+  };
 
-  useEffect(() => {
-    void probe('/api/v1/health').then(setApi);
-    void probe('/api/v1/health/db').then(setDb);
-  }, []);
+  async function logout() {
+    await api.logout();
+    setUser(null);
+    setDoc(null);
+  }
 
   return (
-    <main style={{ fontFamily: 'system-ui, sans-serif', padding: 24 }}>
-      <h1>Converge</h1>
-      <ul>
-        <li>API: <span data-testid="api-status">{label[api]}</span></li>
-        <li>Database: <span data-testid="db-status">{label[db]}</span></li>
-      </ul>
+    <main style={{ fontFamily: 'system-ui, sans-serif', padding: 24, maxWidth: 720 }}>
+      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+        <h1>Converge</h1>
+        {user && (
+          <span>
+            {user.displayName} <button type="button" onClick={() => void logout()}>ログアウト</button>
+          </span>
+        )}
+      </header>
+      <HealthPanel />
+      {!user && <AuthForm api={api} onSignedIn={setUser} />}
+      {user && !doc && <DocumentList api={api} onOpen={setDoc} />}
+      {user && doc && <DocumentRoom key={doc.id} api={api} doc={doc} onBack={() => setDoc(null)} />}
     </main>
   );
 }
