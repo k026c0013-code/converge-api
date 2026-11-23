@@ -4,7 +4,9 @@ import { Type } from 'typebox';
 import { writeAudit } from '../audit.js';
 import { authenticate } from '../auth/authenticate.js';
 import { normalizeEmail } from '../auth/service.js';
+import type { TicketStore } from '../collab/tickets.js';
 import type { AuthConfig, RateLimitConfig } from '../config.js';
+import type { AccessEvents } from '../events.js';
 import { AppError } from '../errors.js';
 import { Prisma, type PrismaClient } from '../generated/prisma/client.js';
 import { DocumentView, Email, MemberRole, MemberView, Title, Uuid, errors, strict } from '../schemas.js';
@@ -14,6 +16,8 @@ export interface DocumentRoutesOptions {
   prisma: PrismaClient;
   auth: AuthConfig;
   rateLimits: RateLimitConfig;
+  events: AccessEvents;
+  tickets: TicketStore;
 }
 
 const IdParams = Type.Object({ id: Uuid }, strict);
@@ -199,6 +203,7 @@ export const documentRoutes: FastifyPluginAsyncTypebox<DocumentRoutesOptions> = 
           await writeAudit(tx, { action: 'document.delete', actorUserId: request.userId, documentId: access.document.id, ip: request.ip });
         }
       });
+      opts.events.emit('documentDeleted', { documentId: access.document.id });
       return reply.code(204).send(null);
     },
   );
@@ -332,6 +337,7 @@ export const documentRoutes: FastifyPluginAsyncTypebox<DocumentRoutesOptions> = 
           include: { user: true },
         });
       });
+      opts.events.emit('memberRoleChanged', { documentId: access.document.id, userId: member.userId, role: request.body.role });
       return {
         userId: member.userId,
         displayName: member.user.displayName,
@@ -370,7 +376,35 @@ export const documentRoutes: FastifyPluginAsyncTypebox<DocumentRoutesOptions> = 
           ip: request.ip,
         });
       });
+      opts.events.emit('memberRemoved', { documentId: access.document.id, userId: request.params.userId });
       return reply.code(204).send(null);
+    },
+  );
+
+  // ---- realtime ----------------------------------------------------------
+
+  app.post(
+    '/:id/ws-ticket',
+    {
+      schema: {
+        tags: ['realtime'],
+        summary: 'Issue a 30-second, single-use ticket for /ws/documents/{id}?ticket=… (ADR-0005)',
+        security,
+        params: IdParams,
+        response: {
+          201: Type.Object({ ticket: Type.String(), expiresIn: Type.Integer() }),
+          ...errors(400, 401, 404, 429),
+        },
+      },
+    },
+    async (request, reply) => {
+      const access = await loadAccess(prisma, request.params.id, request.userId);
+      const issued = await opts.tickets.issue({
+        userId: request.userId,
+        documentId: access.document.id,
+        familyId: request.tokenFamilyId,
+      });
+      return reply.code(201).send(issued);
     },
   );
 };

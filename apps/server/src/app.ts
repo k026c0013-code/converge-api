@@ -3,6 +3,10 @@ import swagger from '@fastify/swagger';
 import type { TypeBoxTypeProvider } from '@fastify/type-provider-typebox';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { authRoutes } from './auth/routes.js';
+import type { HubLimits } from './collab/hub.js';
+import { attachCollab } from './collab/server.js';
+import { MemoryTicketStore, type TicketStore } from './collab/tickets.js';
+import { AccessEvents } from './events.js';
 import { DEFAULT_RATE_LIMITS, type AuthConfig, type RateLimitConfig } from './config.js';
 import { documentRoutes } from './documents/routes.js';
 import { AppError, registerErrorHandling } from './errors.js';
@@ -21,7 +25,17 @@ export interface AppOptions {
   prisma?: PrismaClient;
   auth?: AuthConfig;
   rateLimits?: RateLimitConfig;
+  /** Realtime endpoint settings (ADR-0009). Mounted together with the REST API. */
+  realtime?: {
+    allowedOrigins: string[];
+    tickets?: TicketStore;
+    limits?: Partial<HubLimits>;
+    maxPayloadBytes?: number;
+  };
 }
+
+/** Browser origins allowed to open WebSockets during local development (Vite). */
+export const DEV_ALLOWED_ORIGINS = ['http://127.0.0.1:5173', 'http://localhost:5173'];
 
 /** Request body limit for REST (requirements §13, ADR-0008 §4). */
 export const BODY_LIMIT_BYTES = 64 * 1024;
@@ -91,7 +105,17 @@ export function buildApp(options: AppOptions): FastifyInstance {
   app.get('/api/v1/openapi.json', { schema: { hide: true } }, async () => app.swagger());
 
   if (options.prisma && options.auth) {
-    const deps = { prisma: options.prisma, auth: options.auth, rateLimits: limits };
+    const events = new AccessEvents();
+    const tickets = options.realtime?.tickets ?? new MemoryTicketStore();
+    const deps = { prisma: options.prisma, auth: options.auth, rateLimits: limits, events, tickets };
+    attachCollab(app, {
+      prisma: options.prisma,
+      tickets,
+      events,
+      allowedOrigins: options.realtime?.allowedOrigins ?? DEV_ALLOWED_ORIGINS,
+      limits: options.realtime?.limits,
+      maxPayloadBytes: options.realtime?.maxPayloadBytes,
+    });
     void app.register(authRoutes, { ...deps, prefix: '/api/v1/auth' });
     void app.register(userRoutes, { ...deps, prefix: '/api/v1/users' });
     void app.register(documentRoutes, { ...deps, prefix: '/api/v1/documents' });

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AuthConfig } from '../config.js';
+import type { AccessEvents } from '../events.js';
 import { writeAudit } from '../audit.js';
 import { AppError } from '../errors.js';
 import { Prisma, type PrismaClient } from '../generated/prisma/client.js';
@@ -39,6 +40,7 @@ export class AuthService {
   constructor(
     private readonly prisma: PrismaClient,
     private readonly config: AuthConfig,
+    private readonly events: AccessEvents,
   ) {}
 
   private async issueTokens(db: Tx | PrismaClient, userId: string, familyId: string): Promise<{ pair: TokenPair; id: string }> {
@@ -53,7 +55,7 @@ export class AuthService {
         expiresAt: new Date(Date.now() + this.config.refreshTokenTtlSec * 1000),
       },
     });
-    const accessToken = await signAccessToken(this.config, userId);
+    const accessToken = await signAccessToken(this.config, userId, familyId);
     return {
       id,
       pair: { tokenType: 'Bearer', accessToken, expiresIn: this.config.accessTokenTtlSec, refreshToken },
@@ -145,5 +147,7 @@ export class AuthService {
 
   private async revokeFamily(familyId: string, at: Date): Promise<void> {
     await this.prisma.refreshToken.updateMany({ where: { familyId, revokedAt: null }, data: { revokedAt: at } });
+    // Close realtime sessions opened from this family (ADR-0009 §4).
+    this.events.emit('tokenFamilyRevoked', { familyId });
   }
 }

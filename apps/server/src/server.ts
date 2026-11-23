@@ -1,4 +1,4 @@
-import { buildApp } from './app.js';
+import { DEV_ALLOWED_ORIGINS, buildApp } from './app.js';
 import { loadAuthConfig } from './config.js';
 import { createPrismaClient } from './db/client.js';
 
@@ -14,6 +14,11 @@ const app = buildApp({
   logger: true,
   prisma,
   auth,
+  realtime: {
+    allowedOrigins: process.env.WS_ALLOWED_ORIGINS
+      ? process.env.WS_ALLOWED_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
+      : DEV_ALLOWED_ORIGINS,
+  },
   dbCheck: async () => {
     await prisma.$queryRaw`SELECT 1`;
   },

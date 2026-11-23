@@ -24,17 +24,17 @@ describe('password hashing', () => {
 
 describe('access tokens', () => {
   it('round-trips the user id', async () => {
-    const token = await signAccessToken(testAuth, 'user-1');
-    expect(await verifyAccessToken(testAuth, token)).toBe('user-1');
+    const token = await signAccessToken(testAuth, 'user-1', 'fam-1');
+    expect(await verifyAccessToken(testAuth, token)).toEqual({ userId: 'user-1', familyId: 'fam-1' });
   });
 
   it('rejects a token signed with another secret', async () => {
-    const token = await signAccessToken({ ...testAuth, jwtSecret: 'x'.repeat(40) }, 'user-1');
+    const token = await signAccessToken({ ...testAuth, jwtSecret: 'x'.repeat(40) }, 'user-1', 'fam-1');
     expect(await verifyAccessToken(testAuth, token)).toBeNull();
   });
 
   it('rejects a tampered payload', async () => {
-    const token = await signAccessToken(testAuth, 'user-1');
+    const token = await signAccessToken(testAuth, 'user-1', 'fam-1');
     const [h, , s] = token.split('.');
     const forged = Buffer.from(JSON.stringify({ sub: 'admin', iss: 'converge-api', aud: 'converge-api', exp: 9e9 })).toString('base64url');
     expect(await verifyAccessToken(testAuth, `${h}.${forged}.${s}`)).toBeNull();
@@ -52,7 +52,7 @@ describe('access tokens', () => {
   });
 
   it('rejects the wrong audience and the "none" algorithm', async () => {
-    const wrongAud = await signAccessToken({ ...testAuth, jwtAudience: 'other' }, 'user-1');
+    const wrongAud = await signAccessToken({ ...testAuth, jwtAudience: 'other' }, 'user-1', 'fam-1');
     expect(await verifyAccessToken(testAuth, wrongAud)).toBeNull();
     const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
     const payload = Buffer.from(JSON.stringify({ sub: 'user-1', iss: 'converge-api', aud: 'converge-api' })).toString('base64url');

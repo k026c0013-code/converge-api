@@ -1,6 +1,7 @@
 import type { FastifyPluginAsyncTypebox } from '@fastify/type-provider-typebox';
 import { Type } from 'typebox';
 import type { AuthConfig, RateLimitConfig } from '../config.js';
+import type { AccessEvents } from '../events.js';
 import type { PrismaClient } from '../generated/prisma/client.js';
 import { DisplayName, Email, Password, TokenPair, UserView, errors, strict } from '../schemas.js';
 import { AuthService } from './service.js';
@@ -9,13 +10,14 @@ export interface AuthRoutesOptions {
   prisma: PrismaClient;
   auth: AuthConfig;
   rateLimits: RateLimitConfig;
+  events: AccessEvents;
 }
 
 const AuthResult = Type.Object({ user: UserView, tokens: TokenPair });
 const RefreshBody = Type.Object({ refreshToken: Type.String({ minLength: 1, maxLength: 512 }) }, strict);
 
 export const authRoutes: FastifyPluginAsyncTypebox<AuthRoutesOptions> = async (app, opts) => {
-  const service = new AuthService(opts.prisma, opts.auth);
+  const service = new AuthService(opts.prisma, opts.auth, opts.events);
   const authLimit = { rateLimit: { max: opts.rateLimits.authPerMinute, timeWindow: '1 minute' } };
 
   app.post(

@@ -4,8 +4,14 @@ import type { AuthConfig } from '../config.js';
 
 const encoder = new TextEncoder();
 
-export async function signAccessToken(config: AuthConfig, userId: string): Promise<string> {
-  return new SignJWT({})
+export interface AccessClaims {
+  userId: string;
+  /** Refresh-token family this access token was issued from (ADR-0009 §4). */
+  familyId: string;
+}
+
+export async function signAccessToken(config: AuthConfig, userId: string, familyId: string): Promise<string> {
+  return new SignJWT({ fid: familyId })
     .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
     .setSubject(userId)
     .setIssuer(config.jwtIssuer)
@@ -15,15 +21,17 @@ export async function signAccessToken(config: AuthConfig, userId: string): Promi
     .sign(encoder.encode(config.jwtSecret));
 }
 
-/** Returns the user id, or null for any invalid, expired or tampered token. */
-export async function verifyAccessToken(config: AuthConfig, token: string): Promise<string | null> {
+/** Returns the claims, or null for any invalid, expired or tampered token. */
+export async function verifyAccessToken(config: AuthConfig, token: string): Promise<AccessClaims | null> {
   try {
     const { payload } = await jwtVerify(token, encoder.encode(config.jwtSecret), {
       algorithms: ['HS256'],
       issuer: config.jwtIssuer,
       audience: config.jwtAudience,
     });
-    return typeof payload.sub === 'string' && payload.sub.length > 0 ? payload.sub : null;
+    if (typeof payload.sub !== 'string' || payload.sub.length === 0) return null;
+    if (typeof payload.fid !== 'string' || payload.fid.length === 0) return null;
+    return { userId: payload.sub, familyId: payload.fid };
   } catch {
     return null;
   }
