@@ -33,7 +33,7 @@ export function App() {
       <HealthPanel />
       {!user && <AuthForm api={api} onSignedIn={setUser} />}
       {user && !doc && <DocumentList api={api} onOpen={setDoc} />}
-      {user && doc && <DocumentRoom key={doc.id} api={api} doc={doc} onBack={() => setDoc(null)} />}
+      {user && doc && <DocumentRoom key={doc.id} api={api} user={user} doc={doc} onBack={() => setDoc(null)} />}
     </main>
   );
 }

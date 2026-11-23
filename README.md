@@ -2,7 +2,7 @@
 
 リアルタイム共同編集 API と Web アプリ。要件は `docs/requirements-v1.0.md`、レビューは `docs/requirements-review.md`、設計判断は `docs/adr/`。
 
-現在: **Phase 2（リアルタイム通信: 接続・在席管理・中継）完了**。設計は ADR-0008（Phase 1）、ADR-0009（Phase 2）。
+現在: **Phase 3（Yjs による共同編集）完了**。設計は ADR-0008（Phase 1）、ADR-0009（Phase 2）、ADR-0010（Phase 3）。
 
 ## 前提
 - Node.js 24 / pnpm 12（`corepack enable pnpm`）
@@ -50,12 +50,14 @@ pnpm typecheck
 
 エラーは常に `{"error":{"code","message","details"?}}`。メンバーでない文書には 404 を返す（存在を隠す）。
 
-## リアルタイム（Phase 2, ADR-0009）
+## リアルタイム（ADR-0009, ADR-0010）
 1. `POST /api/v1/documents/{id}/ws-ticket`（JWT 付き）で 30 秒・1 回限りのチケットを取る
 2. `ws://…/ws/documents/{id}?ticket=…` へ接続 → `session:ready`（参加者一覧）
-3. `update:submit` は同じ文書の他の接続へ `update:broadcast` として中継される（Phase 2 は保存しない・ACK なし）
+3. `sync:request {stateVector}` → `sync:response {update, stateVector}` → `sync:complete`
+4. `update:submit`（Yjs 更新, base64）→ 検証（`content` ルートのみ）→ `document_updates` に保存 → `update:ack` → 他の接続へ `update:broadcast`
+5. `awareness:update` は名前・色をサーバーが上書きして配信（保存しない）
 
 権限変更は接続中にも反映される（降格 → `session:role_changed`、除外 4003、文書削除 4004、ログアウト 4001）。
-クライアントライブラリは `packages/client`（`@converge/client`: チケット取得・在席・中継・自動再接続）。
-Web アプリ（`pnpm dev` → http://127.0.0.1:5173）でログイン → 文書を開くと参加者一覧と中継テストが見られる。
+クライアントライブラリは `packages/client`（`@converge/client`: `ConvergeConnection` = チケット・在席・自動再接続、`YjsSync` = Y.Doc/Awareness の同期と再接続時の差分回復）。
+Web アプリ（`pnpm dev` → http://127.0.0.1:5173）でログイン → 文書を開くと Tiptap エディタで共同編集できる（見出し・太字・斜体・箇条書き・番号付き・他人のカーソル）。
 ブラウザの Origin 許可リストは `WS_ALLOWED_ORIGINS`（既定は Vite の開発サーバー）。

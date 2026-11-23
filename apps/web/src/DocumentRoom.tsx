@@ -1,6 +1,9 @@
-import { ConvergeConnection, type Participant, type Role, type Status, type StopReason } from '@converge/client';
-import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { ApiError, type Api, type DocumentInfo } from './api';
+import { ConvergeConnection, YjsSync, type Participant, type Role, type Status, type StopReason, type SyncState } from '@converge/client';
+import { useEffect, useState, type FormEvent } from 'react';
+import { Awareness } from 'y-protocols/awareness';
+import * as Y from 'yjs';
+import { ApiError, type Api, type DocumentInfo, type User } from './api';
+import { Editor } from './Editor';
 
 const statusLabel: Record<Status, string> = {
   idle: '待機中',
@@ -9,6 +12,8 @@ const statusLabel: Record<Status, string> = {
   reconnecting: '再接続中…',
   closed: '切断',
 };
+
+const syncLabel: Record<SyncState, string> = { offline: 'オフライン', syncing: '同期中…', synced: '同期済み' };
 
 const stopLabel: Record<StopReason, string> = {
   closed_by_client: '閉じました',
@@ -19,55 +24,41 @@ const stopLabel: Record<StopReason, string> = {
   policy_violation: 'サーバーが接続を拒否しました',
 };
 
-interface Relayed {
-  key: string;
-  from: string;
-  text: string;
-}
-
-/**
- * Phase 2 document room: presence and an opaque relay check (ADR-0007).
- * The rich-text editor and cursors arrive in Phase 3.
- */
-export function DocumentRoom({ api, doc, onBack }: { api: Api; doc: DocumentInfo; onBack: () => void }) {
+/** Document room: collaborative editor, presence and sync status (Phase 3, ADR-0010). */
+export function DocumentRoom({ api, user, doc, onBack }: { api: Api; user: User; doc: DocumentInfo; onBack: () => void }) {
   const [status, setStatus] = useState<Status>('idle');
+  const [sync, setSync] = useState<{ state: SyncState; pending: number }>({ state: 'offline', pending: 0 });
   const [role, setRole] = useState<Role | null>(null);
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [relayed, setRelayed] = useState<Relayed[]>([]);
   const [stopped, setStopped] = useState<StopReason | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [text, setText] = useState('');
   const [memberEmail, setMemberEmail] = useState('');
   const [memberRole, setMemberRole] = useState<'editor' | 'viewer'>('editor');
-  const connRef = useRef<ConvergeConnection | null>(null);
-  const namesRef = useRef(new Map<string, string>());
+
+  // One Y.Doc + Awareness per effect run (StrictMode-safe: each run owns and destroys its own).
+  const [shared, setShared] = useState<{ ydoc: Y.Doc; awareness: Awareness } | null>(null);
 
   useEffect(() => {
+    const ydoc = new Y.Doc();
+    const awareness = new Awareness(ydoc);
+    setShared({ ydoc, awareness });
     const conn = new ConvergeConnection({ documentId: doc.id, getAccessToken: () => api.accessToken() });
-    connRef.current = conn;
+    const yjs = new YjsSync(conn, ydoc, awareness);
     conn.on('status', setStatus);
     conn.on('ready', (r) => setRole(r.role));
     conn.on('roleChanged', setRole);
-    conn.on('participants', (ps) => {
-      for (const p of ps) namesRef.current.set(p.userId, p.displayName);
-      setParticipants(ps);
-    });
-    conn.on('update', (u) =>
-      setRelayed((list) => [
-        ...list.slice(-19),
-        { key: u.updateId, from: namesRef.current.get(u.from.userId) ?? u.from.userId, text: new TextDecoder().decode(u.payload) },
-      ]),
-    );
-    conn.on('serverError', (e) => setNotice(e.code === 'FORBIDDEN' ? '閲覧者は送信できません' : e.message));
+    conn.on('participants', setParticipants);
+    conn.on('serverError', (e) => setNotice(e.code === 'FORBIDDEN' ? '閲覧者は編集できません' : e.message));
     conn.on('stopped', setStopped);
+    yjs.onChange((state, pending) => setSync({ state, pending }));
     conn.connect();
-    return () => conn.close();
+    return () => {
+      yjs.destroy();
+      conn.close();
+      awareness.destroy();
+      ydoc.destroy();
+    };
   }, [api, doc.id]);
-
-  function send(e: FormEvent) {
-    e.preventDefault();
-    if (connRef.current?.sendUpdate(new TextEncoder().encode(text))) setText('');
-  }
 
   async function addMember(e: FormEvent) {
     e.preventDefault();
@@ -80,38 +71,30 @@ export function DocumentRoom({ api, doc, onBack }: { api: Api; doc: DocumentInfo
     }
   }
 
+  const editable = role !== null && role !== 'viewer' && status === 'open';
+
   return (
     <section>
       <button type="button" onClick={onBack}>← 一覧へ</button>
       <h2>{doc.title}</h2>
       <p>
-        状態: <strong data-testid="conn-status">{statusLabel[status]}</strong>
+        接続: <strong data-testid="conn-status">{statusLabel[status]}</strong> ／ 同期:{' '}
+        <strong data-testid="sync-status">
+          {syncLabel[sync.state]}
+          {sync.pending > 0 && `（保存待ち ${sync.pending}）`}
+        </strong>
         {role && <> ／ あなたの権限: {role}</>}
       </p>
       {stopped && stopped !== 'closed_by_client' && <p role="alert" style={{ color: '#b00020' }}>{stopLabel[stopped]}</p>}
       {notice && <p>{notice}</p>}
+
+      {shared && <Editor doc={shared.ydoc} awareness={shared.awareness} editable={editable} userName={user.displayName} />}
 
       <h3>参加中（{participants.length}）</h3>
       <ul data-testid="participants">
         {participants.map((p) => (
           <li key={p.sessionId}>
             {p.displayName} <small>（{p.role}）</small>
-          </li>
-        ))}
-      </ul>
-
-      <h3>中継テスト</h3>
-      <p style={{ fontSize: 13, color: '#666' }}>
-        Phase 2 は中身を解釈せずに他の参加者へ届けるだけです（保存はされません）。エディタは Phase 3 で入ります。
-      </p>
-      <form onSubmit={send} style={{ display: 'flex', gap: 8 }}>
-        <input aria-label="送るテキスト" value={text} onChange={(e) => setText(e.target.value)} required disabled={status !== 'open'} />
-        <button type="submit" disabled={status !== 'open' || role === 'viewer'}>送信</button>
-      </form>
-      <ul>
-        {relayed.map((r) => (
-          <li key={r.key}>
-            <strong>{r.from}</strong>: {r.text}
           </li>
         ))}
       </ul>
