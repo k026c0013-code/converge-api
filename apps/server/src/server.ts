@@ -1,4 +1,5 @@
 import { buildApp } from './app.js';
+import { loadAuthConfig } from './config.js';
 import { createPrismaClient } from './db/client.js';
 
 function requireEnv(name: string): string {
@@ -7,9 +8,12 @@ function requireEnv(name: string): string {
   return value;
 }
 
+const auth = loadAuthConfig(process.env);
 const prisma = createPrismaClient(requireEnv('DATABASE_URL'));
 const app = buildApp({
   logger: true,
+  prisma,
+  auth,
   dbCheck: async () => {
     await prisma.$queryRaw`SELECT 1`;
   },

@@ -2,7 +2,7 @@
 
 リアルタイム共同編集 API と Web アプリ。要件は `docs/requirements-v1.0.md`、レビューは `docs/requirements-review.md`、設計判断は `docs/adr/`。
 
-現在: **Phase 0（開発基盤）完了**。
+現在: **Phase 1（基本 API: 認証・ドキュメント・権限）完了**。設計は ADR-0008。
 
 ## 前提
 - Node.js 24 / pnpm 12（`corepack enable pnpm`）
@@ -13,7 +13,11 @@
 pnpm install
 cp apps/server/.env.example apps/server/.env   # パスワードを設定
 pnpm --filter @converge/server db:generate     # Prisma Client を生成
+pnpm --filter @converge/server db:migrate      # dev DB にマイグレーションを適用
+# テスト DB にも適用（TEST_DATABASE_URL を DATABASE_URL として渡す）
+#   cd apps/server && DATABASE_URL=<TEST_DATABASE_URL の値> npx prisma migrate deploy
 ```
+`.env` の `JWT_SECRET` は 32 文字以上の乱数にする（未設定・短い・`CHANGE_ME` のままだと起動しない）。
 
 ## 起動
 ```sh
@@ -27,8 +31,21 @@ pnpm test       # server: 単体テスト + MySQL 結合テスト（TEST_DATABAS
 pnpm typecheck
 ```
 
-## エンドポイント（Phase 0）
-| メソッド | パス | 内容 |
-|---|---|---|
-| GET | /api/v1/health | プロセスの死活監視（DB には触れない） |
-| GET | /api/v1/health/db | DB 疎通。異常時は 503 `{"error":{"code":"DB_UNAVAILABLE",...}}`。最大 3 秒で応答する |
+## エンドポイント
+仕様は OpenAPI 3.1（`docs/openapi.json`、実行中は `GET /api/v1/openapi.json`）。再生成: `pnpm --filter @converge/server openapi:export`
+
+| メソッド | パス | 内容 | 権限 |
+|---|---|---|---|
+| GET | /api/v1/health | プロセスの死活監視（DB には触れない） | なし |
+| GET | /api/v1/health/db | DB 疎通。異常時は 503 `DB_UNAVAILABLE`（最大 3 秒） | なし |
+| POST | /api/v1/auth/register | 登録（トークンも返す） | なし |
+| POST | /api/v1/auth/login | ログイン | なし |
+| POST | /api/v1/auth/refresh | リフレッシュトークンのローテーション（再利用を検知したら系列ごと失効） | なし |
+| POST | /api/v1/auth/logout | リフレッシュトークンの系列を失効 | なし |
+| GET | /api/v1/users/me | 自分の情報 | ログイン |
+| POST / GET | /api/v1/documents | 作成 / 一覧（カーソルページング） | ログイン |
+| GET / PATCH / DELETE | /api/v1/documents/{id} | 取得 / タイトル変更（Owner・Editor）/ 論理削除（Owner） | メンバー |
+| GET / POST | /api/v1/documents/{id}/members | 一覧 / 追加（Owner、メールで指定） | メンバー |
+| PATCH / DELETE | /api/v1/documents/{id}/members/{userId} | 権限変更 / 削除（Owner） | Owner |
+
+エラーは常に `{"error":{"code","message","details"?}}`。メンバーでない文書には 404 を返す（存在を隠す）。

@@ -1,4 +1,4 @@
-// Converge API schema. Models arrive in Phase 1 (see docs/requirements-v1.0.md §8, ADR-0002).
+// Converge API schema. See docs/requirements-v1.0.md §8, ADR-0002 (MySQL types), ADR-0006, ADR-0008.
 
 generator client {
   provider = "prisma-client"
@@ -7,4 +7,85 @@ generator client {
 
 datasource db {
   provider = "mysql"
+}
+
+model User {
+  id           String   @id @db.Char(36)
+  email        String   @unique @db.VarChar(254)
+  displayName  String   @map("display_name") @db.VarChar(50)
+  passwordHash String   @map("password_hash") @db.VarChar(255)
+  createdAt    DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  refreshTokens  RefreshToken[]
+  ownedDocuments Document[]
+  memberships    DocumentMember[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id           String    @id @db.Char(36)
+  userId       String    @map("user_id") @db.Char(36)
+  familyId     String    @map("family_id") @db.Char(36)
+  /// SHA-256 of the opaque token, hex. The token itself is never stored.
+  tokenHash    String    @unique @map("token_hash") @db.Char(64)
+  expiresAt    DateTime  @map("expires_at") @db.DateTime(3)
+  revokedAt    DateTime? @map("revoked_at") @db.DateTime(3)
+  replacedById String?   @map("replaced_by_id") @db.Char(36)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([familyId])
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model Document {
+  id            String    @id @db.Char(36)
+  title         String    @db.VarChar(200)
+  ownerId       String    @map("owner_id") @db.Char(36)
+  engine        String    @default("yjs") @db.VarChar(16)
+  formatVersion Int       @default(1) @map("format_version")
+  createdAt     DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt     DateTime? @map("deleted_at") @db.DateTime(3)
+
+  owner   User             @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  members DocumentMember[]
+
+  @@index([ownerId, deletedAt])
+  @@map("documents")
+}
+
+model DocumentMember {
+  documentId String   @map("document_id") @db.Char(36)
+  userId     String   @map("user_id") @db.Char(36)
+  /// "editor" | "viewer". The owner lives in documents.owner_id (ADR-0008).
+  role       String   @db.VarChar(16)
+  joinedAt   DateTime @default(now()) @map("joined_at") @db.DateTime(3)
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@id([documentId, userId])
+  @@index([userId])
+  @@map("document_members")
+}
+
+/// Security/audit trail, separate from the CRDT update log (requirements §4.6).
+model AuditLog {
+  id           BigInt   @id @default(autoincrement())
+  actorUserId  String?  @map("actor_user_id") @db.Char(36)
+  action       String   @db.VarChar(64)
+  documentId   String?  @map("document_id") @db.Char(36)
+  targetUserId String?  @map("target_user_id") @db.Char(36)
+  ip           String?  @db.VarChar(45)
+  metadata     Json?
+  createdAt    DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([actorUserId, createdAt])
+  @@index([documentId, createdAt])
+  @@map("audit_logs")
 }
