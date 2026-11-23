@@ -1,4 +1,4 @@
-/** Wire format for /ws/documents/{id} (ADR-0009 §2). JSON text frames only. */
+/** Wire format for /ws/documents/{id} (ADR-0009 §2, ADR-0010 §4). JSON text frames only. */
 
 export type SessionRole = 'owner' | 'editor' | 'viewer';
 
@@ -13,11 +13,18 @@ export type ServerMessage =
   | { type: 'session:ready'; sessionId: string; userId: string; role: SessionRole; participants: Participant[] }
   | { type: 'document:user_joined'; participant: Participant }
   | { type: 'document:user_left'; participant: Participant }
+  | { type: 'sync:response'; update: string; stateVector: string }
+  | { type: 'sync:complete' }
+  | { type: 'update:ack'; updateId: string }
   | { type: 'update:broadcast'; updateId: string; payload: string; from: { sessionId: string; userId: string } }
+  | { type: 'awareness:update'; payload: string }
   | { type: 'session:role_changed'; role: SessionRole }
   | { type: 'error'; code: string; message: string; ref?: string };
 
-export type ClientMessage = { type: 'update:submit'; updateId: string; payload: string };
+export type ClientMessage =
+  | { type: 'update:submit'; updateId: string; payload: string }
+  | { type: 'sync:request'; stateVector: string }
+  | { type: 'awareness:update'; payload: string };
 
 export const CloseCode = {
   goingAway: 1001,
@@ -40,34 +47,44 @@ export type ParseResult =
   | { ok: true; message: ClientMessage }
   | { ok: false; code: 'INVALID_MESSAGE' | 'UNSUPPORTED_TYPE'; message: string; ref?: string };
 
-/** Phase 3 adds these; until then they are recognised but refused (ADR-0009 §2). */
-const LATER_TYPES = new Set(['awareness:update', 'sync:request']);
+const invalid = (message: string, ref?: string): ParseResult =>
+  ref ? { ok: false, code: 'INVALID_MESSAGE', message, ref } : { ok: false, code: 'INVALID_MESSAGE', message };
+
+function exactKeys(m: Record<string, unknown>, keys: string[]): boolean {
+  const own = Object.keys(m);
+  return own.length === keys.length && keys.every((k) => own.includes(k));
+}
+
+const isB64 = (v: unknown, allowEmpty = false): v is string =>
+  typeof v === 'string' && (allowEmpty || v.length > 0) && BASE64_RE.test(v);
 
 export function parseClientMessage(raw: string): ParseResult {
   let data: unknown;
   try {
     data = JSON.parse(raw);
   } catch {
-    return { ok: false, code: 'INVALID_MESSAGE', message: 'Message is not valid JSON' };
+    return invalid('Message is not valid JSON');
   }
-  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
-    return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a JSON object' };
-  }
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) return invalid('Message must be a JSON object');
   const m = data as Record<string, unknown>;
-  if (m.type !== 'update:submit') {
-    if (typeof m.type === 'string' && LATER_TYPES.has(m.type)) {
-      return { ok: false, code: 'UNSUPPORTED_TYPE', message: `${m.type} is not supported yet` };
+
+  switch (m.type) {
+    case 'update:submit': {
+      const ref = typeof m.updateId === 'string' && isUuid(m.updateId) ? m.updateId : undefined;
+      if (!exactKeys(m, ['type', 'updateId', 'payload'])) return invalid('update:submit takes exactly type, updateId and payload', ref);
+      if (!ref) return invalid('updateId must be a UUID');
+      if (!isB64(m.payload)) return invalid('payload must be non-empty base64', ref);
+      return { ok: true, message: { type: 'update:submit', updateId: ref, payload: m.payload } };
     }
-    return { ok: false, code: 'UNSUPPORTED_TYPE', message: 'Unknown message type' };
+    case 'sync:request':
+      if (!exactKeys(m, ['type', 'stateVector'])) return invalid('sync:request takes exactly type and stateVector');
+      if (!isB64(m.stateVector, true)) return invalid('stateVector must be base64');
+      return { ok: true, message: { type: 'sync:request', stateVector: m.stateVector } };
+    case 'awareness:update':
+      if (!exactKeys(m, ['type', 'payload'])) return invalid('awareness:update takes exactly type and payload');
+      if (!isB64(m.payload)) return invalid('payload must be non-empty base64');
+      return { ok: true, message: { type: 'awareness:update', payload: m.payload } };
+    default:
+      return { ok: false, code: 'UNSUPPORTED_TYPE', message: 'Unknown message type' };
   }
-  const ref = typeof m.updateId === 'string' && isUuid(m.updateId) ? m.updateId : undefined;
-  const keys = Object.keys(m);
-  if (keys.length !== 3 || !keys.includes('updateId') || !keys.includes('payload')) {
-    return { ok: false, code: 'INVALID_MESSAGE', message: 'update:submit takes exactly type, updateId and payload', ref };
-  }
-  if (!ref) return { ok: false, code: 'INVALID_MESSAGE', message: 'updateId must be a UUID' };
-  if (typeof m.payload !== 'string' || m.payload.length === 0 || !BASE64_RE.test(m.payload)) {
-    return { ok: false, code: 'INVALID_MESSAGE', message: 'payload must be non-empty base64', ref };
-  }
-  return { ok: true, message: { type: 'update:submit', updateId: ref, payload: m.payload } };
 }

@@ -44,6 +44,12 @@ export interface ConvergeEvents {
   roleChanged: (role: Role) => void;
   serverError: (error: ServerError) => void;
   stopped: (reason: StopReason) => void;
+  /** Server's reply to requestSync: missing updates and the server's state vector (ADR-0010 §4). */
+  syncResponse: (sync: { update: Uint8Array; stateVector: Uint8Array }) => void;
+  syncComplete: () => void;
+  /** The update with this id is persisted on the server. */
+  ack: (updateId: string) => void;
+  awareness: (payload: Uint8Array) => void;
 }
 
 type WebSocketCtor = new (url: string) => WebSocket;
@@ -106,6 +112,10 @@ export class ConvergeConnection {
     roleChanged: new Set(),
     serverError: new Set(),
     stopped: new Set(),
+    syncResponse: new Set(),
+    syncComplete: new Set(),
+    ack: new Set(),
+    awareness: new Set(),
   };
   private socket: WebSocket | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -166,8 +176,24 @@ export class ConvergeConnection {
     return updateId;
   }
 
+  /** Asks for the updates this client is missing. Returns false when not connected. */
+  requestSync(stateVector: Uint8Array): boolean {
+    return this.sendJson({ type: 'sync:request', stateVector: toBase64(stateVector) });
+  }
+
+  /** Sends a y-protocols awareness update. Returns false when not connected. */
+  sendAwareness(payload: Uint8Array): boolean {
+    return this.sendJson({ type: 'awareness:update', payload: toBase64(payload) });
+  }
+
   close(): void {
     this.stop('closed_by_client');
+  }
+
+  private sendJson(msg: object): boolean {
+    if (this._status !== 'open' || !this.socket) return false;
+    this.socket.send(JSON.stringify(msg));
+    return true;
   }
 
   private async open(): Promise<void> {
@@ -254,6 +280,21 @@ export class ConvergeConnection {
         this.emit('participants', this.participants);
         break;
       }
+      case 'sync:response':
+        this.emit('syncResponse', {
+          update: fromBase64(msg.update as string),
+          stateVector: fromBase64(msg.stateVector as string),
+        });
+        break;
+      case 'sync:complete':
+        this.emit('syncComplete');
+        break;
+      case 'update:ack':
+        this.emit('ack', msg.updateId as string);
+        break;
+      case 'awareness:update':
+        this.emit('awareness', fromBase64(msg.payload as string));
+        break;
       case 'error':
         this.emit('serverError', { code: msg.code as string, message: msg.message as string, ref: msg.ref as string | undefined });
         break;
@@ -295,3 +336,4 @@ export class ConvergeConnection {
     for (const fn of this.listeners[event]) (fn as (...a: Parameters<ConvergeEvents[K]>) => void)(...args);
   }
 }
+export { REMOTE, YjsSync, type SyncState } from './yjs.js';

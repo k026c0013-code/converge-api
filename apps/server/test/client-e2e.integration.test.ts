@@ -2,6 +2,7 @@ import { ConvergeConnection, type Participant, type RemoteUpdate, type StopReaso
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildApp } from '../src/app.js';
+import { yUpdate } from './ws-helpers.js';
 import { bearer, createTestPrisma, registerUser, relaxedLimits, testAuth, testDbUrl, type TestPrisma, type TestUser } from './helpers.js';
 
 /** Waits until `predicate` holds, polling briefly. */
@@ -60,7 +61,7 @@ describe.skipIf(!testDbUrl)('@converge/client against the real server (Phase 2 c
     const keys = clients.map((c) => key(c.state.participants));
     expect(new Set(keys).size).toBe(1); // every client sees the same participant set
 
-    const bytes = new Uint8Array([0, 1, 2, 250, 255]);
+    const bytes = yUpdate('from A');
     const id = clients[1]!.conn.sendUpdate(bytes);
     await until(() => clients[0]!.state.updates.length === 1 && clients[2]!.state.updates.length === 1);
     expect(clients[0]!.state.updates[0]).toMatchObject({ updateId: id, payload: bytes });

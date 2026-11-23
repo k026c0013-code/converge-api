@@ -5,7 +5,7 @@ import { buildApp } from '../src/app.js';
 import type { HubLimits } from '../src/collab/hub.js';
 import { MemoryTicketStore } from '../src/collab/tickets.js';
 import { bearer, createTestPrisma, registerUser, relaxedLimits, testAuth, testDbUrl, type TestPrisma, type TestUser } from './helpers.js';
-import { b64, expectRejected, issueTicket, join, rawConnect } from './ws-helpers.js';
+import { b64, expectRejected, issueTicket, join, rawConnect, yB64 } from './ws-helpers.js';
 
 const ORIGIN = 'http://app.example.test';
 
@@ -121,7 +121,7 @@ describe.skipIf(!testDbUrl)('realtime /ws/documents/{id} (MySQL)', () => {
   });
 
   describe('relay', () => {
-    it('relays opaque payloads to the other sessions of the same document only', async () => {
+    it('persists, ACKs the sender and broadcasts to the other sessions of the same document only', async () => {
       const t = await team();
       const other = (await api(t.owner, 'POST', '/documents', { title: 'elsewhere' })).json() as { id: string };
       const sender = await join(app, t.editor, t.docId);
@@ -130,15 +130,16 @@ describe.skipIf(!testDbUrl)('realtime /ws/documents/{id} (MySQL)', () => {
       const elsewhere = await join(app, t.owner, other.id);
 
       const updateId = randomUUID();
-      sender.client.send({ type: 'update:submit', updateId, payload: b64('hello') });
+      const payload = yB64('hello');
+      sender.client.send({ type: 'update:submit', updateId, payload });
 
+      expect(await sender.client.next('update:ack')).toEqual({ type: 'update:ack', updateId });
       for (const c of [peer.client, viewer.client]) {
         const msg = await c.next('update:broadcast');
-        expect(msg).toEqual({ type: 'update:broadcast', updateId, payload: b64('hello'), from: { sessionId: sender.ready.sessionId, userId: t.editor.id } });
+        expect(msg).toEqual({ type: 'update:broadcast', updateId, payload, from: { sessionId: sender.ready.sessionId, userId: t.editor.id } });
       }
       expect(await sender.client.none('update:broadcast')).toBe(true);
       expect(await elsewhere.client.none('update:broadcast')).toBe(true);
-      expect(await sender.client.none('update:ack')).toBe(true); // Phase 2 does not persist, so no ACK (ADR-0009 §2)
       for (const c of [sender, peer, viewer, elsewhere]) c.client.close();
     });
 
@@ -147,20 +148,22 @@ describe.skipIf(!testDbUrl)('realtime /ws/documents/{id} (MySQL)', () => {
       const viewer = await join(app, t.viewer, t.docId);
       const owner = await join(app, t.owner, t.docId);
       const updateId = randomUUID();
-      viewer.client.send({ type: 'update:submit', updateId, payload: b64('nope') });
+      viewer.client.send({ type: 'update:submit', updateId, payload: yB64('nope') });
       expect(await viewer.client.next('error')).toMatchObject({ code: 'FORBIDDEN', ref: updateId });
       expect(await owner.client.none('update:broadcast')).toBe(true);
       viewer.client.close();
       owner.client.close();
     });
 
-    it('answers invalid and not-yet-supported messages with error', async () => {
+    it('answers invalid messages, unknown types and non-Yjs payloads with error', async () => {
       const t = await team();
       const c = await join(app, t.editor, t.docId);
       c.client.send('not json');
       expect(await c.client.next('error')).toMatchObject({ code: 'INVALID_MESSAGE' });
-      c.client.send({ type: 'awareness:update', state: {} });
+      c.client.send({ type: 'presence:poke' });
       expect(await c.client.next('error')).toMatchObject({ code: 'UNSUPPORTED_TYPE' });
+      c.client.send({ type: 'update:submit', updateId: randomUUID(), payload: b64('not a yjs update') });
+      expect(await c.client.next('error')).toMatchObject({ code: 'INVALID_UPDATE' });
       c.client.ws.send(Buffer.from([1, 2, 3]), { binary: true });
       expect(await c.client.next('error')).toMatchObject({ code: 'INVALID_MESSAGE' });
       c.client.close();
@@ -175,12 +178,12 @@ describe.skipIf(!testDbUrl)('realtime /ws/documents/{id} (MySQL)', () => {
 
       await api(t.owner, 'PATCH', `/documents/${t.docId}/members/${t.viewer.id}`, { role: 'editor' });
       expect(await viewer.client.next('session:role_changed')).toMatchObject({ role: 'editor' });
-      viewer.client.send({ type: 'update:submit', updateId: randomUUID(), payload: b64('now allowed') });
+      viewer.client.send({ type: 'update:submit', updateId: randomUUID(), payload: yB64('now allowed') });
       await owner.client.next('update:broadcast');
 
       await api(t.owner, 'PATCH', `/documents/${t.docId}/members/${t.viewer.id}`, { role: 'viewer' });
       expect(await viewer.client.next('session:role_changed')).toMatchObject({ role: 'viewer' });
-      viewer.client.send({ type: 'update:submit', updateId: randomUUID(), payload: b64('blocked again') });
+      viewer.client.send({ type: 'update:submit', updateId: randomUUID(), payload: yB64('blocked again') });
       expect(await viewer.client.next('error')).toMatchObject({ code: 'FORBIDDEN' });
       viewer.client.close();
       owner.client.close();

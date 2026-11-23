@@ -1,3 +1,4 @@
+import * as Y from 'yjs';
 import type { FastifyInstance } from 'fastify';
 import { WebSocket } from 'ws';
 import { bearer, type TestUser } from './helpers.js';
@@ -106,3 +107,14 @@ export function expectRejected(client: Client): Promise<number> {
 }
 
 export const b64 = (s: string) => Buffer.from(s).toString('base64');
+
+/** A valid Yjs update that appends a paragraph to the `content` root of a fresh doc. */
+export function yUpdate(text: string): Uint8Array {
+  const doc = new Y.Doc();
+  const p = new Y.XmlElement('paragraph');
+  p.insert(0, [new Y.XmlText(text)]);
+  doc.getXmlFragment('content').insert(0, [p]);
+  return Y.encodeStateAsUpdate(doc);
+}
+
+export const yB64 = (text: string) => Buffer.from(yUpdate(text)).toString('base64');

@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
 import type { AccessEvents } from '../events.js';
 import type { PrismaClient } from '../generated/prisma/client.js';
+import { LiveDocuments } from './documents.js';
 import { CollabHub, DEFAULT_HUB_LIMITS, type HubLimits } from './hub.js';
 import { isUuid, type SessionRole } from './protocol.js';
 import type { TicketStore } from './tickets.js';
@@ -17,6 +18,8 @@ export interface CollabOptions {
   /** Max size of one incoming frame (ADR-0009 §2). */
   maxPayloadBytes?: number;
   limits?: Partial<HubLimits>;
+  /** How long an unused document stays in memory after its last session leaves. */
+  unloadDelayMs?: number;
 }
 
 export const MAX_WS_PAYLOAD_BYTES = 1024 * 1024;
@@ -46,8 +49,11 @@ function rejectUpgrade(socket: Duplex, status: number, code: string): void {
  * Mounts the realtime endpoint /ws/documents/{id}?ticket=… on the Fastify HTTP server (ADR-0009 §1).
  * The handshake is validated before upgrading so failures are plain HTTP errors.
  */
-export function attachCollab(app: FastifyInstance, opts: CollabOptions): CollabHub {
-  const hub = new CollabHub(opts.events, { ...DEFAULT_HUB_LIMITS, ...opts.limits });
+export function attachCollab(app: FastifyInstance, opts: CollabOptions): { hub: CollabHub; live: LiveDocuments } {
+  const live = new LiveDocuments(opts.prisma, opts.unloadDelayMs);
+  const hub = new CollabHub(opts.events, live, { ...DEFAULT_HUB_LIMITS, ...opts.limits }, (err, context) =>
+    app.log.error({ err }, context),
+  );
   const wss = new WebSocketServer({ noServer: true, maxPayload: opts.maxPayloadBytes ?? MAX_WS_PAYLOAD_BYTES });
   const allowed = new Set(opts.allowedOrigins);
 
@@ -67,7 +73,7 @@ export function attachCollab(app: FastifyInstance, opts: CollabOptions): CollabH
     // Re-check access: membership may have changed since the ticket was issued.
     const doc = await opts.prisma.document.findFirst({
       where: { id: documentId, deletedAt: null },
-      select: { ownerId: true, members: { where: { userId: claims.userId }, select: { role: true } } },
+      select: { ownerId: true, engine: true, members: { where: { userId: claims.userId }, select: { role: true } } },
     });
     const user = await opts.prisma.user.findUnique({ where: { id: claims.userId }, select: { displayName: true } });
     if (!doc || !user) throw new Reject(404, 'NOT_FOUND');
@@ -75,13 +81,19 @@ export function attachCollab(app: FastifyInstance, opts: CollabOptions): CollabH
       doc.ownerId === claims.userId ? 'owner' : (doc.members[0]?.role as SessionRole | undefined);
     if (role !== 'owner' && role !== 'editor' && role !== 'viewer') throw new Reject(404, 'NOT_FOUND');
 
-    return { documentId, userId: claims.userId, familyId: claims.familyId, displayName: user.displayName, role };
+    // Load (or reuse) the live document before upgrading, so a load failure is a plain 500.
+    await live.acquire(documentId, doc.engine);
+    return { documentId, engine: doc.engine, userId: claims.userId, familyId: claims.familyId, displayName: user.displayName, role };
   }
 
   const onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     socket.on('error', () => socket.destroy());
     authorize(req).then(
       (init) => {
+        if (socket.destroyed) {
+          live.release(init.documentId);
+          return;
+        }
         wss.handleUpgrade(req, socket, head, (ws) => hub.attach(ws, init));
       },
       (err: unknown) => {
@@ -102,5 +114,5 @@ export function attachCollab(app: FastifyInstance, opts: CollabOptions): CollabH
     hub.close();
     wss.close();
   });
-  return hub;
+  return { hub, live };
 }

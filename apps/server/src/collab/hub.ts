@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { WebSocket } from 'ws';
+import { MAX_AWARENESS_BYTES, decodeAwareness, encodeAwareness, sanitizeAwareness } from '../crdt/awareness.js';
+import { engineFor } from '../crdt/engine.js';
 import type { AccessEvents } from '../events.js';
-import { CloseCode, parseClientMessage, type Participant, type ServerMessage, type SessionRole } from './protocol.js';
+import type { LiveDocuments } from './documents.js';
+import { CloseCode, parseClientMessage, type ClientMessage, type Participant, type ServerMessage, type SessionRole } from './protocol.js';
 
 export interface HubLimits {
   heartbeatMs: number;
@@ -26,6 +29,7 @@ export const DEFAULT_HUB_LIMITS: HubLimits = {
 
 export interface SessionInit {
   documentId: string;
+  engine: string;
   userId: string;
   displayName: string;
   role: SessionRole;
@@ -40,6 +44,11 @@ interface Session extends SessionInit {
   windowStart: number;
   windowCount: number;
   lifetimeTimer: NodeJS.Timeout;
+  /** The single awareness clientID this session may speak for (ADR-0010 §5). */
+  awarenessClientId: number | null;
+  awarenessClock: number;
+  /** Last forwarded awareness update, replayed to sessions that join later. */
+  lastAwareness: string | null;
 }
 
 const participantOf = (s: Session): Participant => ({
@@ -49,9 +58,11 @@ const participantOf = (s: Session): Participant => ({
   role: s.role,
 });
 
+const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64');
+const fromB64 = (s: string) => new Uint8Array(Buffer.from(s, 'base64'));
+
 /**
- * Phase 2 realtime hub: presence plus opaque relay of update payloads (ADR-0007, ADR-0009).
- * Nothing here is persisted.
+ * Realtime hub (ADR-0009, ADR-0010): presence, Yjs sync, persisted updates with ACK, awareness.
  */
 export class CollabHub {
   private readonly docs = new Map<string, Map<string, Session>>();
@@ -60,7 +71,9 @@ export class CollabHub {
 
   constructor(
     events: AccessEvents,
+    private readonly live: LiveDocuments,
     private readonly limits: HubLimits = DEFAULT_HUB_LIMITS,
+    private readonly onError: (err: unknown, context: string) => void = () => {},
   ) {
     this.heartbeat = setInterval(() => this.checkHeartbeats(), limits.heartbeatMs);
     this.heartbeat.unref();
@@ -99,7 +112,10 @@ export class CollabHub {
     };
   }
 
-  /** Registers an upgraded socket. Sends session:ready to it and user_joined to the others. */
+  /**
+   * Registers an upgraded socket. The caller must already hold a LiveDocuments reference
+   * for init.documentId; the hub releases it when the socket closes.
+   */
   attach(socket: WebSocket, init: SessionInit): void {
     const session: Session = {
       ...init,
@@ -110,6 +126,9 @@ export class CollabHub {
       windowStart: Date.now(),
       windowCount: 0,
       lifetimeTimer: setTimeout(() => socket.close(CloseCode.sessionExpired, 'session expired'), this.limits.maxLifetimeMs),
+      awarenessClientId: null,
+      awarenessClock: 0,
+      lastAwareness: null,
     };
     session.lifetimeTimer.unref();
 
@@ -135,7 +154,10 @@ export class CollabHub {
       role: session.role,
       participants: [...sessions.values()].map(participantOf),
     });
-    for (const o of others) this.send(o, { type: 'document:user_joined', participant: participantOf(session) });
+    for (const o of others) {
+      this.send(o, { type: 'document:user_joined', participant: participantOf(session) });
+      if (o.lastAwareness) this.send(session, { type: 'awareness:update', payload: o.lastAwareness });
+    }
   }
 
   participants(documentId: string): Participant[] {
@@ -162,7 +184,16 @@ export class CollabHub {
     const sessions = this.docs.get(session.documentId);
     if (!sessions?.delete(session.id)) return;
     if (sessions.size === 0) this.docs.delete(session.documentId);
-    for (const o of sessions.values()) this.send(o, { type: 'document:user_left', participant: participantOf(session) });
+    this.live.release(session.documentId);
+
+    const gone =
+      session.awarenessClientId === null
+        ? null
+        : b64(encodeAwareness([{ clientId: session.awarenessClientId, clock: session.awarenessClock + 1, state: null }]));
+    for (const o of sessions.values()) {
+      this.send(o, { type: 'document:user_left', participant: participantOf(session) });
+      if (gone) this.send(o, { type: 'awareness:update', payload: gone });
+    }
   }
 
   private sessionsOf(documentId: string): Session[] {
@@ -179,7 +210,6 @@ export class CollabHub {
       session.socket.close(CloseCode.policyViolation, 'rate limit exceeded');
       return;
     }
-
     if (isBinary) {
       this.violation(session, 'INVALID_MESSAGE', 'Binary frames are not supported; send JSON text');
       return;
@@ -189,19 +219,87 @@ export class CollabHub {
       this.violation(session, parsed.code, parsed.message, parsed.ref);
       return;
     }
+    this.dispatch(session, parsed.message);
+  }
 
-    const msg = parsed.message;
+  private dispatch(session: Session, msg: ClientMessage): void {
+    switch (msg.type) {
+      case 'sync:request': {
+        let result: { update: Uint8Array; stateVector: Uint8Array };
+        try {
+          result = this.live.syncFor(session.documentId, fromB64(msg.stateVector));
+        } catch {
+          this.violation(session, 'INVALID_MESSAGE', 'stateVector could not be decoded');
+          return;
+        }
+        const { update, stateVector } = result;
+        this.send(session, { type: 'sync:response', update: b64(update), stateVector: b64(stateVector) });
+        this.send(session, { type: 'sync:complete' });
+        return;
+      }
+      case 'update:submit':
+        void this.submit(session, msg.updateId, msg.payload);
+        return;
+      case 'awareness:update':
+        this.awareness(session, msg.payload);
+        return;
+    }
+  }
+
+  /** ADR-0003 / ADR-0010 §3: validate → persist → apply → ACK → broadcast. */
+  private async submit(session: Session, updateId: string, payload: string): Promise<void> {
     if (session.role === 'viewer') {
-      this.send(session, { type: 'error', code: 'FORBIDDEN', message: 'Viewers cannot edit this document', ref: msg.updateId });
+      this.send(session, { type: 'error', code: 'FORBIDDEN', message: 'Viewers cannot edit this document', ref: updateId });
       return;
     }
-    const out: ServerMessage = {
-      type: 'update:broadcast',
-      updateId: msg.updateId,
-      payload: msg.payload,
-      from: { sessionId: session.id, userId: session.userId },
-    };
+    const update = fromB64(payload);
+    const check = engineFor(session.engine).validateUpdate(update);
+    if (!check.ok) {
+      this.violation(session, check.code, check.reason, updateId);
+      return;
+    }
+    let outcome: 'applied' | 'duplicate';
+    try {
+      outcome = await this.live.submit(session.documentId, {
+        updateId,
+        sessionId: session.id,
+        userId: session.userId,
+        update,
+      });
+    } catch (err) {
+      this.onError(err, 'persisting update');
+      this.send(session, { type: 'error', code: 'PERSIST_FAILED', message: 'The update was not saved; it will be resent on resync', ref: updateId });
+      return;
+    }
+    this.send(session, { type: 'update:ack', updateId });
+    if (outcome === 'duplicate') return; // already delivered the first time (CT-05)
+    const out: ServerMessage = { type: 'update:broadcast', updateId, payload, from: { sessionId: session.id, userId: session.userId } };
     for (const o of this.sessionsOf(session.documentId)) if (o.id !== session.id) this.send(o, out);
+  }
+
+  private awareness(session: Session, payload: string): void {
+    const bytes = fromB64(payload);
+    if (bytes.byteLength > MAX_AWARENESS_BYTES) {
+      this.violation(session, 'INVALID_MESSAGE', 'awareness update is too large');
+      return;
+    }
+    let sanitized: Uint8Array | null;
+    try {
+      if (session.awarenessClientId === null) {
+        session.awarenessClientId = decodeAwareness(bytes)[0]?.clientId ?? null;
+        if (session.awarenessClientId === null) return;
+      }
+      sanitized = sanitizeAwareness(bytes, session.awarenessClientId, { userId: session.userId, displayName: session.displayName });
+    } catch {
+      this.violation(session, 'INVALID_MESSAGE', 'awareness update could not be decoded');
+      return;
+    }
+    if (!sanitized) return;
+    const clock = decodeAwareness(sanitized)[0]?.clock ?? 0;
+    session.awarenessClock = Math.max(session.awarenessClock, clock);
+    const out = b64(sanitized);
+    session.lastAwareness = out;
+    for (const o of this.sessionsOf(session.documentId)) if (o.id !== session.id) this.send(o, { type: 'awareness:update', payload: out });
   }
 
   private violation(session: Session, code: string, message: string, ref?: string): void {

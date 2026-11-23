@@ -54,6 +54,7 @@ model Document {
 
   owner   User             @relation(fields: [ownerId], references: [id], onDelete: Restrict)
   members DocumentMember[]
+  updates DocumentUpdate[]
 
   @@index([ownerId, deletedAt])
   @@map("documents")
@@ -72,6 +73,24 @@ model DocumentMember {
   @@id([documentId, userId])
   @@index([userId])
   @@map("document_members")
+}
+
+/// CRDT update log (requirements §8.4, ADR-0010 §3). Written with INSERT … ON DUPLICATE KEY UPDATE.
+model DocumentUpdate {
+  id         BigInt   @id @default(autoincrement())
+  documentId String   @map("document_id") @db.Char(36)
+  updateId   String   @map("update_id") @db.Char(36)
+  /// sessionId of the connection that submitted the update.
+  clientId   String   @map("client_id") @db.VarChar(64)
+  userId     String   @map("user_id") @db.Char(36)
+  updateData Bytes    @map("update_data") @db.LongBlob
+  createdAt  DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, updateId])
+  @@index([documentId, id])
+  @@map("document_updates")
 }
 
 /// Security/audit trail, separate from the CRDT update log (requirements §4.6).

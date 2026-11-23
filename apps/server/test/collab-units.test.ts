@@ -17,7 +17,8 @@ describe('parseClientMessage', () => {
     ['not JSON', '{', 'INVALID_MESSAGE'],
     ['an array', '[]', 'INVALID_MESSAGE'],
     ['unknown type', JSON.stringify({ type: 'hack' }), 'UNSUPPORTED_TYPE'],
-    ['awareness (Phase 3)', JSON.stringify({ type: 'awareness:update' }), 'UNSUPPORTED_TYPE'],
+    ['awareness without payload', JSON.stringify({ type: 'awareness:update' }), 'INVALID_MESSAGE'],
+    ['sync:request with extra keys', JSON.stringify({ type: 'sync:request', stateVector: '', x: 1 }), 'INVALID_MESSAGE'],
     ['non-uuid updateId', JSON.stringify({ type: 'update:submit', updateId: 'upd_001', payload: 'AQID' }), 'INVALID_MESSAGE'],
     ['non-base64 payload', JSON.stringify({ type: 'update:submit', updateId: id, payload: '***' }), 'INVALID_MESSAGE'],
     ['empty payload', JSON.stringify({ type: 'update:submit', updateId: id, payload: '' }), 'INVALID_MESSAGE'],
@@ -26,6 +27,11 @@ describe('parseClientMessage', () => {
     const r = parseClientMessage(raw);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.code).toBe(code);
+  });
+
+  it('accepts sync:request (empty state vector allowed) and awareness:update', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'sync:request', stateVector: '' }))).toMatchObject({ ok: true });
+    expect(parseClientMessage(JSON.stringify({ type: 'awareness:update', payload: 'AQID' }))).toMatchObject({ ok: true });
   });
 
   it('echoes a valid updateId as ref when the rest is invalid', () => {
