@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import * as Y from 'yjs';
 import { CONTENT_ROOT, engineFor, type CRDTEngine } from '../crdt/engine.js';
 import { Prisma, type PrismaClient } from '../generated/prisma/client.js';
+import { NO_TIMING, type StageTimer } from './timing.js';
 
 export interface SubmitInput {
   updateId: string;
@@ -16,6 +17,7 @@ export interface ServerUpdate {
   updateId: string;
   userId: string;
   update: Uint8Array;
+  dbId: bigint;
 }
 
 export interface VersionInfo {
@@ -37,6 +39,10 @@ interface Live {
   /** Highest document_updates.id reflected in `doc` (0n when none). */
   lastUpdateId: bigint;
   updatesSinceSnapshot: number;
+  /** Lower bound for the next catch-up sweep (ADR-0013 §3). */
+  sweptAt: Date;
+  /** Recently applied document_updates ids → when we saw them; the sweep only fetches the others. */
+  seenIds: Map<bigint, number>;
 }
 
 export interface LiveDocumentsOptions {
@@ -44,6 +50,7 @@ export interface LiveDocumentsOptions {
   /** Take a snapshot after this many updates (ADR-0012 §1). */
   snapshotEvery?: number;
   onError?: (err: unknown, context: string) => void;
+  timing?: StageTimer;
 }
 
 /**
@@ -57,6 +64,7 @@ export class LiveDocuments {
   private readonly unloadDelayMs: number;
   private readonly snapshotEvery: number;
   private readonly onError: (err: unknown, context: string) => void;
+  private readonly timing: StageTimer;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -65,6 +73,7 @@ export class LiveDocuments {
     this.unloadDelayMs = opts.unloadDelayMs ?? 30_000;
     this.snapshotEvery = opts.snapshotEvery ?? 500;
     this.onError = opts.onError ?? (() => {});
+    this.timing = opts.timing ?? NO_TIMING;
   }
 
   onServerUpdate(fn: (u: ServerUpdate) => void): () => void {
@@ -116,6 +125,60 @@ export class LiveDocuments {
     };
   }
 
+  /**
+   * Applies an update another node already persisted (ADR-0013 §2). No-op when the document
+   * is not loaded here: it will be read from the database on first use.
+   */
+  applyRemote(documentId: string, update: Uint8Array, dbId: bigint): boolean {
+    const entry = this.live.get(documentId);
+    if (!entry) return false;
+    entry.engine.applyUpdate(entry.doc, update, 'remote-node');
+    if (dbId > entry.lastUpdateId) entry.lastUpdateId = dbId;
+    entry.seenIds.set(dbId, Date.now());
+    return true;
+  }
+
+  loadedDocuments(): string[] {
+    return [...this.live.keys()];
+  }
+
+  /**
+   * Re-reads recently persisted updates and applies those this node is missing (lost Pub/Sub
+   * messages, races while loading). Returns the diff it applied, or null if nothing was missing.
+   */
+  async sweep(documentId: string, windowMs = 30_000): Promise<Uint8Array | null> {
+    const entry = this.live.get(documentId);
+    if (!entry) return null;
+    const started = new Date();
+    const since = new Date(entry.sweptAt.getTime() - windowMs);
+    // Ids only: almost everything was already applied through Pub/Sub or locally.
+    const recent = await this.prisma.documentUpdate.findMany({
+      where: { documentId, createdAt: { gte: since } },
+      select: { id: true },
+    });
+    entry.sweptAt = started;
+    const cutoff = started.getTime() - 4 * windowMs;
+    for (const [id, at] of entry.seenIds) if (at < cutoff) entry.seenIds.delete(id);
+    const missing = recent.map((r) => r.id).filter((id) => !entry.seenIds.has(id));
+    if (missing.length === 0) return null;
+    const rows = await this.prisma.documentUpdate.findMany({
+      where: { id: { in: missing } },
+      orderBy: { id: 'asc' },
+      select: { id: true, updateData: true },
+    });
+    const before = entry.engine.encodeStateVector(entry.doc);
+    entry.doc.transact(() => {
+      for (const r of rows) {
+        entry.engine.applyUpdate(entry.doc, r.updateData, 'sweep');
+        entry.seenIds.set(r.id, Date.now());
+        if (r.id > entry.lastUpdateId) entry.lastUpdateId = r.id;
+      }
+    }, 'sweep');
+    const diff = entry.engine.getStateDiff(entry.doc, before);
+    const { structs, ds } = Y.decodeUpdate(diff);
+    return structs.length === 0 && ds.clients.size === 0 ? null : diff;
+  }
+
   /** Full encoded state (tests and diagnostics). */
   state(documentId: string): Uint8Array {
     const entry = this.require(documentId);
@@ -126,14 +189,18 @@ export class LiveDocuments {
    * Persists then applies (ADR-0003). Resolves 'duplicate' when (documentId, updateId) already exists.
    * Rejects if the insert fails; in that case nothing was applied.
    */
-  submit(documentId: string, input: SubmitInput): Promise<'applied' | 'duplicate'> {
+  submit(documentId: string, input: SubmitInput): Promise<{ outcome: 'applied'; dbId: bigint } | { outcome: 'duplicate' }> {
     const entry = this.require(documentId);
+    const queued = performance.now();
     return this.enqueue(entry, async () => {
+      const started = performance.now();
+      this.timing.record('queue_wait', started - queued);
       const row = await this.persist(documentId, input.updateId, input.sessionId, input.userId, input.update);
-      if (!row) return 'duplicate';
+      this.timing.record('insert', performance.now() - started);
+      if (!row) return { outcome: 'duplicate' as const };
       this.applyPersisted(documentId, entry, row, input.update);
       await this.maybeSnapshot(documentId, entry);
-      return 'applied';
+      return { outcome: 'applied' as const, dbId: row.id };
     });
   }
 
@@ -179,7 +246,7 @@ export class LiveDocuments {
           const row = await this.persist(documentId, updateId, 'server:restore', input.userId, update);
           if (!row) throw new Error('restore update id collided');
           this.applyPersisted(documentId, entry, row, update);
-          for (const fn of this.serverUpdateListeners) fn({ documentId, updateId, userId: input.userId, update });
+          for (const fn of this.serverUpdateListeners) fn({ documentId, updateId, userId: input.userId, update, dbId: row.id });
           await this.maybeSnapshot(documentId, entry);
         }
         return { preRestoreVersionId: pre.id };
@@ -233,6 +300,7 @@ export class LiveDocuments {
       throw err;
     }
     entry.lastUpdateId = row.id;
+    entry.seenIds.set(row.id, Date.now());
     entry.updatesSinceSnapshot++;
   }
 
@@ -287,6 +355,7 @@ export class LiveDocuments {
     if (pending) return pending;
 
     const promise = (async () => {
+      const loadStartedAt = new Date();
       const engine = engineFor(engineName);
       const doc = engine.createDocument();
       let lastUpdateId = 0n;
@@ -301,6 +370,8 @@ export class LiveDocuments {
       }
       const PAGE = 500;
       let since = 0;
+      // Ids applied from the tail; rows folded into the snapshot may be re-applied once (idempotent).
+      const seenIds = new Map<bigint, number>();
       for (;;) {
         const rows = await this.prisma.documentUpdate.findMany({
           where: { documentId, id: { gt: lastUpdateId } },
@@ -311,11 +382,22 @@ export class LiveDocuments {
         for (const r of rows) {
           engine.applyUpdate(doc, r.updateData, 'persisted');
           lastUpdateId = r.id;
+          seenIds.set(r.id, Date.now());
         }
         since += rows.length;
         if (rows.length < PAGE) break;
       }
-      const entry: Live = { doc, engine, refs: 0, queue: Promise.resolve(), unloadTimer: null, lastUpdateId, updatesSinceSnapshot: since };
+      const entry: Live = {
+        doc,
+        engine,
+        refs: 0,
+        queue: Promise.resolve(),
+        unloadTimer: null,
+        lastUpdateId,
+        updatesSinceSnapshot: since,
+        sweptAt: loadStartedAt,
+        seenIds,
+      };
       this.live.set(documentId, entry);
       return entry;
     })().finally(() => this.loading.delete(documentId));

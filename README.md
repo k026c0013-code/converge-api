@@ -2,7 +2,7 @@
 
 リアルタイム共同編集 API と Web アプリ。要件は `docs/requirements-v1.0.md`、レビューは `docs/requirements-review.md`、設計判断は `docs/adr/`。
 
-現在: **Phase 5（履歴・復元）完了**。設計は ADR-0008〜0012（Phase 1〜5）。
+現在: **Phase 6（分散化）完了**。設計は ADR-0008〜0013（Phase 1〜6）。
 
 ## 前提
 - Node.js 24 / pnpm 12（`corepack enable pnpm`）
@@ -77,4 +77,9 @@ Web アプリ（`pnpm dev` → http://127.0.0.1:5173）でログイン → 文�
 | POST | /api/v1/documents/{id}/restore | 新しい編集として復元。直前の状態は「復元前」バージョンとして自動保存 | Owner |
 
 スナップショットは 500 更新ごととバージョン作成時に作られ、読み込みは「最新スナップショット＋それ以降の更新」で行う。更新ログは削除しない（保持期間は未決定）。
+
+## 複数サーバー（Phase 6, ADR-0013）
+- `docker compose up -d redis` を実行し、`.env` に `REDIS_URL=redis://127.0.0.1:6379` を設定すると、複数の API サーバーで同じ文書を共同編集できる（チケット・在席・更新・権限変更を Redis で共有）。
+- `docker compose --profile lb up -d` で、nginx（:8080）が :3001 と :3002 に振り分ける。
+- 負荷試験は `loadtest/README.md` を参照。結果（2 ノードで反映 P95 87 ms）は ADR-0013 §5 にある。
 

@@ -4,6 +4,8 @@ import type { FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
 import type { AccessEvents } from '../events.js';
 import type { PrismaClient } from '../generated/prisma/client.js';
+import type { Cluster } from '../cluster/cluster.js';
+import type { StageTimer } from './timing.js';
 import type { LiveDocuments } from './documents.js';
 import { CollabHub, DEFAULT_HUB_LIMITS, type HubLimits } from './hub.js';
 import { isUuid, type SessionRole } from './protocol.js';
@@ -20,6 +22,9 @@ export interface CollabOptions {
   limits?: Partial<HubLimits>;
   /** Shared with the REST routes (versions, restore). */
   live: LiveDocuments;
+  /** Other Collaboration Servers (ADR-0013). Defaults to a single local node. */
+  cluster?: Cluster;
+  timing?: StageTimer;
 }
 
 export const MAX_WS_PAYLOAD_BYTES = 1024 * 1024;
@@ -51,8 +56,13 @@ function rejectUpgrade(socket: Duplex, status: number, code: string): void {
  */
 export function attachCollab(app: FastifyInstance, opts: CollabOptions): { hub: CollabHub; live: LiveDocuments } {
   const { live } = opts;
-  const hub = new CollabHub(opts.events, live, { ...DEFAULT_HUB_LIMITS, ...opts.limits }, (err, context) =>
-    app.log.error({ err }, context),
+  const hub = new CollabHub(
+    opts.events,
+    live,
+    { ...DEFAULT_HUB_LIMITS, ...opts.limits },
+    (err, context) => app.log.error({ err }, context),
+    opts.cluster,
+    opts.timing,
   );
   const wss = new WebSocketServer({ noServer: true, maxPayload: opts.maxPayloadBytes ?? MAX_WS_PAYLOAD_BYTES });
   const allowed = new Set(opts.allowedOrigins);

@@ -77,3 +77,13 @@ describe('loadAuthConfig', () => {
     expect(loadAuthConfig({ JWT_SECRET: 'k'.repeat(32) }).accessTokenTtlSec).toBe(900);
   });
 });
+
+describe('loadRateLimits', () => {
+  it('uses defaults, accepts overrides and rejects garbage', async () => {
+    const { loadRateLimits, DEFAULT_RATE_LIMITS } = await import('../src/config.js');
+    expect(loadRateLimits({})).toEqual(DEFAULT_RATE_LIMITS);
+    expect(loadRateLimits({ RATE_LIMIT_AUTH: '1000' }).authPerMinute).toBe(1000);
+    expect(() => loadRateLimits({ RATE_LIMIT_GLOBAL: '0' })).toThrow(/RATE_LIMIT_GLOBAL/);
+    expect(() => loadRateLimits({ RATE_LIMIT_AUTH: 'lots' })).toThrow(/RATE_LIMIT_AUTH/);
+  });
+});

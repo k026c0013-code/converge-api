@@ -92,6 +92,7 @@ model DocumentUpdate {
 
   @@unique([documentId, updateId])
   @@index([documentId, id])
+  @@index([documentId, createdAt])
   @@map("document_updates")
 }
 

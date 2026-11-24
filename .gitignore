@@ -8,3 +8,4 @@ coverage/
 # Prisma generated client
 apps/server/src/generated/
 .vite/
+loadtest/payloads.json

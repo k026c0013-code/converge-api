@@ -22,6 +22,22 @@ export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
   memberAddPerMinute: 20,
 };
 
+/** Rate limits from RATE_LIMIT_GLOBAL / RATE_LIMIT_AUTH / RATE_LIMIT_MEMBER_ADD (per minute), else defaults. */
+export function loadRateLimits(env: NodeJS.ProcessEnv): RateLimitConfig {
+  const read = (name: string, fallback: number) => {
+    const raw = env[name];
+    if (raw === undefined || raw === '') return fallback;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1) throw new Error(`${name} must be a positive integer`);
+    return n;
+  };
+  return {
+    globalPerMinute: read('RATE_LIMIT_GLOBAL', DEFAULT_RATE_LIMITS.globalPerMinute),
+    authPerMinute: read('RATE_LIMIT_AUTH', DEFAULT_RATE_LIMITS.authPerMinute),
+    memberAddPerMinute: read('RATE_LIMIT_MEMBER_ADD', DEFAULT_RATE_LIMITS.memberAddPerMinute),
+  };
+}
+
 export function loadAuthConfig(env: NodeJS.ProcessEnv): AuthConfig {
   const jwtSecret = env.JWT_SECRET;
   if (!jwtSecret || jwtSecret.length < 32 || jwtSecret.includes('CHANGE_ME')) {

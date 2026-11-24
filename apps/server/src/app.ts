@@ -5,9 +5,12 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { authRoutes } from './auth/routes.js';
 import type { HubLimits } from './collab/hub.js';
 import { LiveDocuments } from './collab/documents.js';
+import { StageTimer } from './collab/timing.js';
 import { attachCollab } from './collab/server.js';
 import { MemoryTicketStore, type TicketStore } from './collab/tickets.js';
-import { AccessEvents } from './events.js';
+import { LocalCluster, type AccessMessage, type Cluster } from './cluster/cluster.js';
+import { RedisCluster, RedisTicketStore } from './cluster/redis.js';
+import { AccessEvents, type AccessEventMap } from './events.js';
 import { DEFAULT_RATE_LIMITS, type AuthConfig, type RateLimitConfig } from './config.js';
 import { documentRoutes } from './documents/routes.js';
 import { historyRoutes } from './history/routes.js';
@@ -35,6 +38,8 @@ export interface AppOptions {
     maxPayloadBytes?: number;
     /** Snapshot after this many updates (ADR-0012). */
     snapshotEvery?: number;
+    /** Shared state with other nodes (ADR-0013). Closed together with the app. */
+    cluster?: Cluster;
   };
 }
 
@@ -110,14 +115,22 @@ export function buildApp(options: AppOptions): FastifyInstance {
 
   if (options.prisma && options.auth) {
     const events = new AccessEvents();
-    const tickets = options.realtime?.tickets ?? new MemoryTicketStore();
+    const cluster = options.realtime?.cluster ?? new LocalCluster();
+    bridgeAccessEvents(events, cluster);
+    const tickets =
+      options.realtime?.tickets ?? (cluster instanceof RedisCluster ? new RedisTicketStore(cluster.redis) : new MemoryTicketStore());
+    // Opt-in latency breakdown for load tests (ADR-0013 §5).
+    const timing = new StageTimer(process.env.COLLAB_TIMING === '1', (summary) => app.log.info({ timing: summary }, 'collab timing'));
     const live = new LiveDocuments(options.prisma, {
+      timing,
       snapshotEvery: options.realtime?.snapshotEvery,
       onError: (err, context) => app.log.error({ err }, context),
     });
     const deps = { prisma: options.prisma, auth: options.auth, rateLimits: limits, events, tickets, live };
     attachCollab(app, {
       live,
+      cluster,
+      timing,
       prisma: options.prisma,
       tickets,
       events,
@@ -129,7 +142,34 @@ export function buildApp(options: AppOptions): FastifyInstance {
     void app.register(userRoutes, { ...deps, prefix: '/api/v1/users' });
     void app.register(documentRoutes, { ...deps, prefix: '/api/v1/documents' });
     void app.register(historyRoutes, { ...deps, prefix: '/api/v1/documents' });
+    app.addHook('onClose', async () => {
+      timing.close();
+      await cluster.close();
+    });
   }
 
   return app;
+}
+
+/**
+ * Forwards locally emitted access events to other nodes and re-emits theirs here (ADR-0013 §2, R-13).
+ * Events received from the cluster are not published again.
+ */
+function bridgeAccessEvents(events: AccessEvents, cluster: Cluster): void {
+  if (!cluster.distributed) return;
+  let replaying = false;
+  const names: Array<keyof AccessEventMap> = ['memberRoleChanged', 'memberRemoved', 'documentDeleted', 'tokenFamilyRevoked'];
+  for (const name of names) {
+    events.on(name, (args: AccessEventMap[typeof name][0]) => {
+      if (!replaying) cluster.publishAccess({ event: name, args } as AccessMessage);
+    });
+  }
+  cluster.onAccess((msg) => {
+    replaying = true;
+    try {
+      (events.emit as (e: string, a: unknown) => boolean)(msg.event, msg.args);
+    } finally {
+      replaying = false;
+    }
+  });
 }

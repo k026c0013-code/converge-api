@@ -1,5 +1,6 @@
 import { DEV_ALLOWED_ORIGINS, buildApp } from './app.js';
-import { loadAuthConfig } from './config.js';
+import { loadAuthConfig, loadRateLimits } from './config.js';
+import { RedisCluster } from './cluster/redis.js';
 import { createPrismaClient } from './db/client.js';
 
 function requireEnv(name: string): string {
@@ -10,11 +11,15 @@ function requireEnv(name: string): string {
 
 const auth = loadAuthConfig(process.env);
 const prisma = createPrismaClient(requireEnv('DATABASE_URL'));
+// Multi-node mode when REDIS_URL is set (ADR-0013); otherwise a single local node.
+const cluster = process.env.REDIS_URL ? await RedisCluster.connect(process.env.REDIS_URL) : undefined;
 const app = buildApp({
   logger: true,
   prisma,
   auth,
+  rateLimits: loadRateLimits(process.env),
   realtime: {
+    cluster,
     allowedOrigins: process.env.WS_ALLOWED_ORIGINS
       ? process.env.WS_ALLOWED_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
       : DEV_ALLOWED_ORIGINS,
