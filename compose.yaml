@@ -1,6 +1,11 @@
-# Local infrastructure for Phase 6 (ADR-0013). MySQL stays on the host (ADR-0002).
-#   docker compose up -d redis              # Redis only (tests, single or multiple dev servers)
-#   docker compose --profile lb up -d       # + nginx load balancer on :8080 → API servers on host :3001 and :3002
+# Converge infrastructure.
+#
+#   docker compose up -d redis              # Redis only (local development / tests; MySQL stays on the host, ADR-0002)
+#   docker compose --profile lb up -d       # + nginx on :8080 → API servers running on the host at :3001 / :3002 (ADR-0013)
+#
+#   cp .env.example .env && docker compose --profile full up -d --build
+#                                            # everything in containers: MySQL, Redis, 2 API servers, web + LB
+#                                            # → http://localhost:8080
 services:
   redis:
     image: redis:7.4-alpine
@@ -22,3 +27,63 @@ services:
       - ./infra/nginx.conf:/etc/nginx/nginx.conf:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  # ---- profile "full": the whole system in containers ---------------------
+
+  mysql:
+    profiles: ["full"]
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: converge
+      MYSQL_USER: converge
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    profiles: ["full"]
+    build: { context: ., dockerfile: apps/server/Dockerfile }
+    image: converge-api:local
+    command: ["pnpm", "exec", "prisma", "migrate", "deploy"]
+    environment: &api-env
+      DATABASE_URL: mysql://converge:${MYSQL_PASSWORD}@mysql:3306/converge
+      SHADOW_DATABASE_URL: mysql://converge:${MYSQL_PASSWORD}@mysql:3306/converge_shadow_unused  # required by prisma.config, unused by migrate deploy
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      WS_ALLOWED_ORIGINS: http://localhost:8080,http://127.0.0.1:8080
+    depends_on:
+      mysql: { condition: service_healthy }
+
+  api1:
+    profiles: ["full"]
+    image: converge-api:local
+    environment: *api-env
+    depends_on: &api-deps
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  api2:
+    profiles: ["full"]
+    image: converge-api:local
+    environment: *api-env
+    depends_on: *api-deps
+    restart: unless-stopped
+
+  web:
+    profiles: ["full"]
+    build: { context: ., dockerfile: apps/web/Dockerfile }
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - api1
+      - api2
+
+volumes:
+  mysql-data:

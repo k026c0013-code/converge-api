@@ -2,7 +2,26 @@
 
 リアルタイム共同編集 API と Web アプリ。要件は `docs/requirements-v1.0.md`、レビューは `docs/requirements-review.md`、設計判断は `docs/adr/`。
 
-現在: **Phase 6（分散化）完了**。設計は ADR-0008〜0013（Phase 1〜6）。
+現在: **Phase 6 まで完了し、Phase 7 はコンテナ化と CI まで**（公開サーバーは置かない、ADR-0014）。
+
+## このプロジェクトで示せること
+| 観点 | 内容 | 根拠 |
+|---|---|---|
+| CRDT による共同編集 | Yjs ＋ Tiptap。同時編集・順序の入れ替わり・重複配送があっても全員が同じ状態に収束する | CT-01〜05 のテスト、fast-check による性質ベーステスト（`packages/client/test`, `apps/server/test/crdt.integration.test.ts`） |
+| 永続化の正しさ | 保存してから反映・ACK・配信の順を守る。再起動後も DB から復元できる | ADR-0003, ADR-0010, CT-07 |
+| セキュリティ | argon2id、ローテーションするリフレッシュトークンと再利用検知、1 回限りの WS チケット、Origin 検査、更新内容の検証、Awareness のなりすまし防止、監査ログ | ADR-0005, 0008, 0010、`auth.integration` / `collab.integration` のテスト |
+| オフライン編集 | IndexedDB に保存し、再接続時に state vector で差分を統合する | ADR-0011, CT-06 |
+| 履歴・復元 | スナップショット、名前付きバージョン、新しい編集としての復元（復元前の状態は自動で保存） | ADR-0012, CT-10 |
+| 分散化 | Redis で複数サーバーをつなぐ。取りこぼしは DB から回復し、ノードが落ちても別のノードへ切り替わる | ADR-0013、`cluster.integration` のテスト |
+| 性能 | 2 ノード・100 接続で、反映 P95 87 ms（目標 200 ms）、エラー 0 件 | ADR-0013 §5 |
+| 進め方 | 要件をレビューして、判断を ADR 14 本に残し、テストは 159 件 | `docs/requirements-review.md`, `docs/adr/` |
+
+## すぐに試す（Docker だけで動く）
+```sh
+cp .env.example .env            # 値を乱数に置き換える
+docker compose --profile full up -d --build
+# → http://localhost:8080 を 2 つのブラウザで開き、別々のアカウントで同じ文書を編集する
+```
 
 ## 前提
 - Node.js 24 / pnpm 12（`corepack enable pnpm`）

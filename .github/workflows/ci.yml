@@ -1,0 +1,55 @@
+# CI: typecheck, unit + integration tests against real MySQL 8.0 and Redis 7.4, web build.
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-pw   # throwaway CI container, never used elsewhere
+          MYSQL_DATABASE: converge_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci-root-pw"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=3s --health-retries=10
+    env:
+      TEST_DATABASE_URL: mysql://root:ci-root-pw@127.0.0.1:3306/converge_test
+      DATABASE_URL: mysql://root:ci-root-pw@127.0.0.1:3306/converge_test
+      SHADOW_DATABASE_URL: mysql://root:ci-root-pw@127.0.0.1:3306/converge_shadow
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - run: corepack enable pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Generate Prisma client and apply migrations
+        working-directory: apps/server
+        run: |
+          pnpm db:generate
+          pnpm exec prisma migrate deploy
+      - run: pnpm typecheck
+      - run: pnpm test
+      - name: Build web app
+        run: pnpm --filter @converge/web build
