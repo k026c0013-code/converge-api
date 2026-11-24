@@ -1,5 +1,7 @@
 # Converge API
 
+[![CI](https://github.com/k026c0013-code/converge-api/actions/workflows/ci.yml/badge.svg)](https://github.com/k026c0013-code/converge-api/actions/workflows/ci.yml)
+
 リアルタイム共同編集 API と Web アプリ。要件は `docs/requirements-v1.0.md`、レビューは `docs/requirements-review.md`、設計判断は `docs/adr/`。
 
 現在: **Phase 6 まで完了し、Phase 7 はコンテナ化と CI まで**（公開サーバーは置かない、ADR-0014）。
