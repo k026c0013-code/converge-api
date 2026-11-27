@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "converge": {
+      "command": "node",
+      "args": ["packages/agent/node_modules/tsx/dist/cli.mjs", "packages/agent/src/mcp.ts"]
+    }
+  }
+}

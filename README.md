@@ -16,7 +16,8 @@
 | 履歴・復元 | スナップショット、名前付きバージョン、新しい編集としての復元（復元前の状態は自動で保存） | ADR-0012, CT-10 |
 | 分散化 | Redis で複数サーバーをつなぐ。取りこぼしは DB から回復し、ノードが落ちても別のノードへ切り替わる | ADR-0013、`cluster.integration` のテスト |
 | 性能 | 2 ノード・100 接続で、反映 P95 87 ms（目標 200 ms）、エラー 0 件 | ADR-0013 §5 |
-| 進め方 | 要件をレビューして、判断を ADR 14 本に残し、テストは 159 件 | `docs/requirements-review.md`, `docs/adr/` |
+| AI エージェント連携 | Claude が MCP 経由で文書の参加者になり、人間とリアルタイムに会話する。サーバーには手を入れず、公開 API だけで実現 | ADR-0015、`agent.integration` のテスト |
+| 進め方 | 要件をレビューして、判断を ADR 15 本に残し、テストは 177 件 | `docs/requirements-review.md`, `docs/adr/` |
 
 ## すぐに試す（Docker だけで動く）
 ```sh
@@ -24,6 +25,19 @@ cp .env.example .env            # 値を乱数に置き換える
 docker compose --profile full up -d --build
 # → http://localhost:8080 を 2 つのブラウザで開き、別々のアカウントで同じ文書を編集する
 ```
+
+## AI エージェントと会話する（ADR-0015）
+Claude Code を Converge の参加者にして、同じ文書の上で人間と会話できる。AI の返事は紫の引用ブロックとして、名前付きのカーソルが動きながら少しずつ書き込まれる。
+
+```sh
+docker compose --profile full up -d --build
+pnpm --filter @converge/agent setup-demo   # AI 用・人間用のデモアカウントと文書「Claude と話そう」を作る
+                                           # （ログイン情報は packages/agent/.env、git 管理外）
+claude                                     # このリポジトリで起動すると .mcp.json の converge サーバーが使える
+```
+ブラウザで http://localhost:8080 を開き、`packages/agent/.env` の `DEMO_USER_EMAIL` / `DEMO_USER_PASSWORD` でログインする。Claude Code には「Converge の文書『Claude と話そう』に参加して、私と会話して」と頼む。
+
+MCP のツール: `list_documents` / `join_document` / `read_document` / `wait_for_message`（相手が書き終えるまで待つ）/ `write_reply` / `leave_document`
 
 ## 前提
 - Node.js 24 / pnpm 12（`corepack enable pnpm`）

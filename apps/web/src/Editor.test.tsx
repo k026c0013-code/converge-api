@@ -1,6 +1,7 @@
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
-import { Awareness } from 'y-protocols/awareness';
+import { addReplyParagraph, readBlocks, startReply } from '@converge/agent/text';
+import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import * as Y from 'yjs';
 import { CONTENT_FIELD, Editor } from './Editor';
 
@@ -40,6 +41,53 @@ describe('Editor (Tiptap ⇄ Y.Doc, ADR-0010 §6)', () => {
     await waitFor(() => expect(screen.getByLabelText('本文').textContent).toContain('heading me'));
     act(() => screen.getByRole('button', { name: '見出し1' }).click());
     await waitFor(() => expect(doc.getXmlFragment(CONTENT_FIELD).toString()).toContain('<heading level="1">'));
+  });
+
+  it("shows the AI agent's reply as a quote block and its caret with a name label (ADR-0015)", async () => {
+    const doc = new Y.Doc();
+    const awareness = new Awareness(doc);
+    act(() => remoteParagraph(doc, '質問です'));
+    render(<Editor doc={doc} awareness={awareness} editable userName="Me" />);
+
+    // The agent edits its own copy, exactly as packages/agent does, and the update arrives remotely.
+    const agentDoc = new Y.Doc();
+    Y.applyUpdate(agentDoc, Y.encodeStateAsUpdate(doc));
+    const { text } = startReply(agentDoc, 'お答えします');
+    act(() => Y.applyUpdate(doc, Y.encodeStateAsUpdate(agentDoc, Y.encodeStateVector(doc)), 'remote'));
+
+    await waitFor(() => expect(screen.getByLabelText('本文').querySelector('blockquote')?.textContent).toBe('お答えします'));
+
+    // Its caret, in the format the agent sends (server adds the `user` field).
+    const agentAwareness = new Awareness(agentDoc);
+    const pos = Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(text, text.length));
+    agentAwareness.setLocalState({ cursor: { anchor: pos, head: pos }, user: { name: 'Claude', color: '#7c5cff' } });
+    act(() => applyAwarenessUpdate(awareness, encodeAwarenessUpdate(agentAwareness, [agentDoc.clientID]), 'remote'));
+
+    await waitFor(() => expect(document.querySelector('.collaboration-carets__label')?.textContent).toBe('Claude'));
+    expect(document.querySelector('blockquote .collaboration-carets__caret')).not.toBeNull();
+    agentAwareness.destroy();
+  });
+
+  it('keeps a reply that arrives chunk by chunk while the editor is open (ADR-0015)', async () => {
+    const doc = new Y.Doc();
+    act(() => remoteParagraph(doc, '質問です'));
+    render(<Editor doc={doc} awareness={new Awareness(doc)} editable userName="Me" />);
+    await waitFor(() => expect(screen.getByLabelText('本文').textContent).toContain('質問です'));
+
+    // Each agent step is its own update, exactly as the agent sends them.
+    const agentDoc = new Y.Doc();
+    Y.applyUpdate(agentDoc, Y.encodeStateAsUpdate(doc));
+    const relay = () => act(() => Y.applyUpdate(doc, Y.encodeStateAsUpdate(agentDoc, Y.encodeStateVector(doc)), 'remote'));
+    const { quote, text } = startReply(agentDoc, 'お');
+    relay();
+    for (const ch of ['答え', 'します']) {
+      agentDoc.transact(() => text.insert(text.length, ch));
+      relay();
+    }
+    addReplyParagraph(agentDoc, quote, '二段落目');
+    relay();
+    await waitFor(() => expect(screen.getByLabelText('本文').querySelector('blockquote')?.textContent).toBe('お答えします二段落目'));
+    expect(readBlocks(doc).find((b) => b.fromAgent)?.text).toBe('お答えします\n二段落目'); // nothing was deleted by the editor
   });
 
   it('is read-only without a toolbar for viewers', async () => {

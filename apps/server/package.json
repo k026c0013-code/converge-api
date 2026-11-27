@@ -31,7 +31,9 @@
     "yjs": "13.6.33"
   },
   "devDependencies": {
+    "@converge/agent": "workspace:*",
     "@converge/client": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@types/node": "^24.19.2",
     "@types/ws": "8.18.2",
     "dotenv": "18.0.10",

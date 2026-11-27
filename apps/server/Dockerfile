@@ -9,6 +9,7 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .node-version tsconfig.base
 COPY apps/server/package.json apps/server/
 COPY apps/web/package.json apps/web/
 COPY packages/client/package.json packages/client/
+COPY packages/agent/package.json packages/agent/
 RUN pnpm install --frozen-lockfile --filter @converge/server...
 
 COPY packages/client packages/client

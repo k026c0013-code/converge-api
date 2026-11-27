@@ -5,6 +5,7 @@ import StarterKit from '@tiptap/starter-kit';
 import { useEffect } from 'react';
 import type { Awareness } from 'y-protocols/awareness';
 import type * as Y from 'yjs';
+import './editor.css';
 
 /** The Y.Doc root Tiptap binds to; the server only accepts writes here (ADR-0004, ADR-0010). */
 export const CONTENT_FIELD = 'content';
